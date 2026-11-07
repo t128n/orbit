@@ -81,10 +81,11 @@ pub async fn check_in_transaction(
 
 /// Check the persistent binding without changing it.
 pub async fn check(database: &Database, host: &GitHubHost) -> Result<(), GitHubBindingError> {
-    let mut tx = database.immediate_transaction().await?;
-    check_in_transaction(&mut tx, host).await?;
-    tx.commit().await?;
-    Ok(())
+    let bound: Option<String> =
+        sqlx::query_scalar("SELECT origin FROM github_host_binding WHERE singleton = 1")
+            .fetch_optional(database.pool())
+            .await?;
+    compare(bound.as_deref().ok_or(GitHubBindingError::Missing)?, host)
 }
 
 #[cfg(test)]

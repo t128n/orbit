@@ -85,10 +85,12 @@ async fn cleanup_postgres(name: Option<String>) {
             sqlx::PgConnection::connect(&std::env::var("ORBIT_TEST_POSTGRES_URL").unwrap())
                 .await
                 .unwrap();
-        sqlx::query(&format!("DROP DATABASE \"{name}\" WITH (FORCE)"))
-            .execute(&mut connection)
-            .await
-            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{name}\" WITH (FORCE)"
+        )))
+        .execute(&mut connection)
+        .await
+        .unwrap();
     }
 }
 

@@ -5,6 +5,7 @@ use orbit_platform::{
     MigrationRunner, TestDatabase,
 };
 
+#[cfg(unix)]
 const OWNERSHIP_CHILD_PATH: &str = "ORBIT_TEST_OWNERSHIP_CHILD_PATH";
 static PROCESS_OWNERSHIP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
