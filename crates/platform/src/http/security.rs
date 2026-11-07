@@ -2,13 +2,14 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 
 use axum::http::header::{
-    HeaderName, HeaderValue, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_SECURITY_POLICY, HeaderName, HeaderValue, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
     X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderMap, Method, Uri};
 use ipnet::IpNet;
 
 use super::RequestId;
+use crate::GitHubHost;
 
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
 const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
@@ -280,6 +281,7 @@ pub(crate) fn add_security_headers(
     headers: &mut HeaderMap,
     secure: bool,
     csp_script_hash: Option<&str>,
+    github_host: &GitHubHost,
 ) {
     let script_source = csp_script_hash
         .map(|hash| format!("script-src 'self' '{hash}'; "))
@@ -288,8 +290,9 @@ pub(crate) fn add_security_headers(
     // plugin creates and then fills through the CSSOM (`insertRule`), which CSP does not restrict.
     // `frame-src` `blob:` is the PDF preview (the file URL itself cannot be framed). Vimeo joins YouTube.
     // `media-src` `https:` lets a document play an audio or video file the page links to.
+    let github_origin = github_host.web_origin();
     let policy = format!(
-        "default-src 'self'; {script_source}style-src 'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='; style-src-attr 'unsafe-inline'; img-src 'self' data: blob: https:; frame-src blob: https://www.youtube-nocookie.com https://player.vimeo.com; media-src 'self' https:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self' https://github.com"
+        "default-src 'self'; {script_source}style-src 'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='; style-src-attr 'unsafe-inline'; img-src 'self' data: blob: https:; frame-src blob: https://www.youtube-nocookie.com https://player.vimeo.com; media-src 'self' https:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self' {github_origin}"
     );
     headers.insert(
         CONTENT_SECURITY_POLICY,
@@ -343,12 +346,12 @@ mod tests {
     use axum::http::header::{AUTHORIZATION, COOKIE, ORIGIN, UPGRADE};
     use axum::http::{HeaderMap, Method, Uri};
 
-    use super::{add_security_headers, bearer_token, OriginPolicy};
+    use super::{OriginPolicy, add_security_headers, bearer_token};
 
     #[test]
     fn responses_refuse_framing_and_isolate_the_opener() {
         let mut headers = HeaderMap::new();
-        add_security_headers(&mut headers, true, None);
+        add_security_headers(&mut headers, true, None, &crate::GitHubHost::default());
         assert_eq!(headers["x-frame-options"], "DENY");
         assert_eq!(headers["cross-origin-opener-policy"], "same-origin");
     }

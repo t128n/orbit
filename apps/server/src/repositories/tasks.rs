@@ -1,6 +1,8 @@
 use orbit_domain::{Actor, DEFAULT_STATUSES, StatusCategory};
 use orbit_platform::SqlBuilder;
-use orbit_platform::{BLOB_REFERENCE_COUNT, Backend, Database, Flag, Id, Row, TimestampMillis};
+use orbit_platform::{
+    BLOB_REFERENCE_COUNT, Backend, Database, Flag, GitHubHost, Id, Row, TimestampMillis,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -425,6 +427,10 @@ pub enum TaskError {
     TrialLimit(TrialLimitReached),
 }
 
+pub(crate) fn github_binding_error(error: crate::github_binding::GitHubBindingError) -> TaskError {
+    TaskError::Unavailable(sqlx::Error::Protocol(error.to_string()))
+}
+
 impl From<TrialCapacityError> for TaskError {
     fn from(error: TrialCapacityError) -> Self {
         match error {
@@ -470,6 +476,7 @@ pub struct TokenActor {
 #[derive(Clone)]
 pub struct TaskRepository {
     database: Database,
+    github_host: GitHubHost,
     project_grant: Option<Vec<Id>>,
     token: Option<TokenActor>,
     /// `expected_version` of task updates and deletes is the task's [`revision`].
@@ -477,6 +484,17 @@ pub struct TaskRepository {
 }
 
 impl TaskRepository {
+    /// Configure the same GitHub host used to bind the database at application startup.
+    #[must_use]
+    pub fn with_github_host(mut self, host: GitHubHost) -> Self {
+        self.github_host = host;
+        self
+    }
+
+    pub fn github_host(&self) -> &GitHubHost {
+        &self.github_host
+    }
+
     pub fn with_project_grant(&self, projects: Vec<Id>) -> Self {
         Self {
             project_grant: Some(projects),
@@ -671,6 +689,7 @@ impl TaskRepository {
     pub fn new(database: Database) -> Self {
         Self {
             database,
+            github_host: GitHubHost::default(),
             project_grant: None,
             token: None,
             revisions: false,
@@ -1851,6 +1870,9 @@ impl TaskRepository {
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<Id, TaskError> {
+        crate::github_binding::check(&self.database, &self.github_host)
+            .await
+            .map_err(github_binding_error)?;
         // A linked task's live description is replaced with the issue body in the transaction
         // below; its room is locked first.
         let linked: Option<String> = sqlx::query_scalar(
@@ -1871,6 +1893,9 @@ impl TaskRepository {
             None => None,
         };
         let mut tx = self.database.immediate_transaction().await?;
+        crate::github_binding::check_in_transaction(&mut tx, &self.github_host)
+            .await
+            .map_err(github_binding_error)?;
         require_access_tx(&mut tx, workspace_id, actor_id).await?;
         let (service_account_id, service_account_name) =
             github_service_account_in_tx(&mut tx, workspace_id, actor_id, now).await?;
@@ -1880,24 +1905,31 @@ impl TaskRepository {
                 .bind(workspace_id.to_string()).bind(&issue.repository).bind(issue.number)
                 .execute(&mut *tx).await?;
         }
-        let path = if issue.kind == "pull_request" {
-            "pull"
+        let (owner, repo) = issue.repository.split_once('/').ok_or(TaskError::Invalid {
+            field: "repository",
+        })?;
+        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            return Err(TaskError::Invalid {
+                field: "repository",
+            });
+        }
+        let issue_url = if issue.kind == "pull_request" {
+            self.github_host.pull_url(owner, repo, issue.number)
         } else {
-            "issues"
+            self.github_host.issue_url(owner, repo, issue.number)
         };
-        let issue_url = format!(
-            "https://github.com/{}/{path}/{}",
-            issue.repository, issue.number
-        );
         let status_category = match (issue.kind, issue.state) {
             ("pull_request", "merged") | ("issue", "closed") => "completed",
             ("pull_request", "closed") => "cancelled",
             _ => "unstarted",
         };
         let existing = sqlx::query(
-            "SELECT github_issue_links.task_id, github_issue_links.kind, tasks.project_id, tasks.status_id, tasks.deleted_at FROM github_issue_links JOIN tasks ON tasks.id = github_issue_links.task_id WHERE github_issue_links.workspace_id = $1 AND repository = $2 AND issue_number = $3",
+            "SELECT github_issue_links.task_id, github_issue_links.kind, tasks.project_id, tasks.status_id, tasks.deleted_at, tasks.source_url FROM github_issue_links JOIN tasks ON tasks.id = github_issue_links.task_id WHERE github_issue_links.workspace_id = $1 AND repository = $2 AND issue_number = $3",
         ).bind(workspace_id.to_string()).bind(&issue.repository).bind(issue.number).fetch_optional(&mut *tx).await?;
         if let Some(row) = &existing {
+            let issue_url = row
+                .get::<Option<String>, _>("source_url")
+                .unwrap_or(issue_url);
             let was_deleted = row.get::<Option<i64>, _>("deleted_at").is_some();
             let task_id = parse_id(row.get("task_id"))?;
             if was_deleted {

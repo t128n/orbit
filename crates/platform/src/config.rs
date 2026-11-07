@@ -12,6 +12,7 @@ use thiserror::Error;
 
 const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 const HTTP_PORT_ENV: &str = "ORBIT_PORT";
+const GITHUB_URL_ENV: &str = "ORBIT_GITHUB_URL";
 const HTTP_BIND_ENV: &str = "ORBIT_BIND";
 const HTTP_PUBLIC_ORIGIN_ENV: &str = "ORBIT_PUBLIC_ORIGIN";
 const HTTP_TRUSTED_PROXIES_ENV: &str = "ORBIT_TRUSTED_PROXIES";
@@ -46,6 +47,7 @@ const IGNORED_ENV_PREFIXES: [&str; 2] = ["ORBIT_DEV_", "ORBIT_TEST_"];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Config {
+    pub github: crate::GitHubHost,
     pub environment: EnvironmentMode,
     pub http: HttpConfig,
     pub data: DataConfig,
@@ -823,6 +825,13 @@ fn apply_environment(
     for (key, value) in environment {
         if key == ENVIRONMENT_ENV {
             config.environment = parse_environment(key, value)?;
+        } else if key == GITHUB_URL_ENV {
+            config.github = value.parse().map_err(|error: crate::InvalidGitHubHost| {
+                ConfigError::InvalidSetting {
+                    key: GITHUB_URL_ENV,
+                    detail: error.to_string(),
+                }
+            })?;
         } else if key == HTTP_PORT_ENV {
             config.http.port = value.parse().map_err(|_| ConfigError::InvalidEnvironment {
                 key: key.clone(),
@@ -1013,6 +1022,25 @@ mod tests {
             config.log_file,
             Some(PathBuf::from("C:\\ProgramData\\Orbit\\logs\\orbit.log"))
         );
+    }
+
+    #[test]
+    fn github_url_is_configured_and_normalized() {
+        assert_eq!(production(&[]).github, crate::GitHubHost::default());
+        let config = production(&[("ORBIT_GITHUB_URL", "https://Git.Example:443/")]);
+        assert_eq!(config.github.web_origin(), "https://git.example");
+        let mut env = BTreeMap::new();
+        env.insert(
+            "ORBIT_GITHUB_URL".to_owned(),
+            "http://git.example".to_owned(),
+        );
+        assert!(matches!(
+            Config::from_environment(env),
+            Err(ConfigError::InvalidSetting {
+                key: GITHUB_URL_ENV,
+                ..
+            })
+        ));
     }
 
     #[test]

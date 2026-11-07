@@ -2,11 +2,11 @@ use std::future::Ready;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -18,7 +18,7 @@ use orbit_platform::{
     RateLimitConfig, RequestId, RequestTransport,
 };
 use serde_json::Value;
-use tower::{service_fn, Layer, Service, ServiceExt};
+use tower::{Layer, Service, ServiceExt, service_fn};
 
 #[derive(Clone)]
 struct PendingService;
@@ -134,9 +134,11 @@ async fn unsafe_requests_reject_foreign_and_missing_origins_as_problem_details()
         assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
         let problem = body_json(response).await;
         assert_eq!(problem["code"], "origin_forbidden");
-        assert!(problem["request_id"]
-            .as_str()
-            .is_some_and(|id| !id.is_empty()));
+        assert!(
+            problem["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
     }
 }
 
@@ -312,10 +314,12 @@ async fn untrusted_forwarded_headers_are_ignored_and_a_uuid_v7_request_id_is_gen
         .to_owned();
     assert_ne!(response_id, "upstream-id");
     assert!(Id::from_str(&response_id).is_ok());
-    assert!(response
-        .headers()
-        .get("strict-transport-security")
-        .is_none());
+    assert!(
+        response
+            .headers()
+            .get("strict-transport-security")
+            .is_none()
+    );
     let body = body_json(response).await;
     assert_eq!(body["request_id"], response_id);
     assert_eq!(body["client_ip"], "192.0.2.10");
@@ -509,9 +513,11 @@ async fn forwarded_chain_cannot_spoof_an_address_before_the_nearest_untrusted_ho
     let response = app.oneshot(request).await.unwrap();
     let body = to_bytes(response.into_body(), 1024).await.unwrap();
 
-    assert!(String::from_utf8(body.to_vec())
-        .unwrap()
-        .ends_with("|203.0.113.9"));
+    assert!(
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .ends_with("|203.0.113.9")
+    );
 }
 
 #[tokio::test]
@@ -837,6 +843,30 @@ async fn csp_allows_only_the_verified_bootstrap_hash_and_local_image_variants() 
         csp,
         "default-src 'self'; script-src 'self' 'sha256-YWJj'; style-src 'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='; style-src-attr 'unsafe-inline'; img-src 'self' data: blob: https:; frame-src blob: https://www.youtube-nocookie.com https://player.vimeo.com; media-src 'self' https:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self' https://github.com"
     );
+}
+
+#[tokio::test]
+async fn csp_form_action_uses_only_the_configured_github_web_origin() {
+    for origin in ["https://acme.ghe.com", "https://github.example:8443"] {
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(
+                HttpPlatformLayer::new(OriginPolicy::new("https://orbit.test"))
+                    .with_csp_github_host(origin.parse().unwrap()),
+            );
+        for (method, status) in [("GET", StatusCode::OK), ("POST", StatusCode::FORBIDDEN)] {
+            let response = app.clone().oneshot(request(method, "/")).await.unwrap();
+            assert_eq!(response.status(), status);
+            let csp = response.headers()[CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap();
+            let form_action = csp
+                .split(';')
+                .find(|d| d.trim().starts_with("form-action "))
+                .unwrap();
+            assert_eq!(form_action.trim(), format!("form-action 'self' {origin}"));
+        }
+    }
 }
 
 #[tokio::test]

@@ -28,7 +28,7 @@ use crate::repositories::identity::{AuthenticatedSession, IdentityError};
 use crate::repositories::sign_in_providers::ProviderSignInError;
 use crate::repositories::two_factor::{RecoveryCodeKey, TwoFactorStatus};
 use crate::secret_box::{decrypt_secret, encrypt_secret};
-use crate::sign_in_providers::{ProviderFailure, ProviderProfile};
+use crate::sign_in_providers::{Provider, ProviderFailure, ProviderProfile};
 
 /// How long a sign-in waits for its second factor, and a passkey ceremony for the browser.
 const PENDING_LIFETIME_MILLIS: i64 = 5 * 60 * 1_000;
@@ -94,6 +94,21 @@ pub(super) enum FirstFactor {
 }
 
 impl Pending {
+    fn uses_github(&self) -> bool {
+        match self {
+            Self::ProviderAuthorization { flow, .. } => flow.provider == Provider::Github,
+            Self::ProviderHandoff { flow, outcome } => {
+                flow.provider == Provider::Github
+                    || matches!(outcome, Ok(profile) if profile.provider == Provider::Github)
+            }
+            Self::ProviderLink { profile, .. } => profile.provider == Provider::Github,
+            Self::Login {
+                first_factor: FirstFactor::Provider { profile, .. },
+                ..
+            } => profile.provider == Provider::Github,
+            _ => false,
+        }
+    }
     /// The serde tag, which [`encode`] writes first in the payload.
     fn kind(&self) -> &'static str {
         match self {
@@ -107,6 +122,13 @@ impl Pending {
     }
 }
 
+/// Unknown or malformed persisted envelopes must not be assumed independent of GitHub.
+pub(crate) fn pending_may_use_github(payload: &str) -> bool {
+    serde_json::from_str::<Pending>(payload)
+        .map(|pending| pending.uses_github())
+        .unwrap_or(true)
+}
+
 /// A `LIKE` pattern for the stored payloads of one kind.
 fn kind_pattern(kind: &str) -> String {
     format!("{{\"kind\":\"{kind}\"%")
@@ -114,6 +136,7 @@ fn kind_pattern(kind: &str) -> String {
 
 pub(super) struct PendingStore {
     database: Database,
+    github_host: orbit_platform::GitHubHost,
 }
 
 fn token_hash(token: &str) -> String {
@@ -125,8 +148,24 @@ fn encode(pending: &Pending) -> Result<String, sqlx::Error> {
 }
 
 impl PendingStore {
-    pub(super) fn new(database: Database) -> Self {
-        Self { database }
+    pub(super) fn new(database: Database, github_host: orbit_platform::GitHubHost) -> Self {
+        Self {
+            database,
+            github_host,
+        }
+    }
+
+    async fn check_binding(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        pending: &Pending,
+    ) -> Result<(), sqlx::Error> {
+        if pending.uses_github() {
+            crate::github_binding::check_in_transaction(transaction, &self.github_host)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Keeps `pending` under a new random token for five minutes. `None` when the store is full.
@@ -143,6 +182,7 @@ impl PendingStore {
         let payload = encode(&pending)?;
         let now = TimestampMillis::now();
         let mut transaction = self.database.immediate_transaction().await?;
+        self.check_binding(&mut transaction, &pending).await?;
         sqlx::query("DELETE FROM auth_pending WHERE expires_at <= $1")
             .bind(now.as_millis())
             .execute(&mut *transaction)
@@ -181,18 +221,25 @@ impl PendingStore {
         .bind(token_hash(token))
         .fetch_optional(&mut *transaction)
         .await?;
-        transaction.commit().await?;
         let Some(row) = row else {
+            transaction.commit().await?;
             return Ok(None);
         };
         let expires_at = TimestampMillis::from_millis(row.get("expires_at"));
         if expires_at <= TimestampMillis::now() {
+            transaction.commit().await?;
             return Ok(None);
         }
+        let payload: String = row.get("payload_json");
+        let pending = serde_json::from_str::<Pending>(&payload).ok();
+        if pending_may_use_github(&payload) {
+            crate::github_binding::check_in_transaction(&mut transaction, &self.github_host)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
+        transaction.commit().await?;
         // An entry an older version wrote in another shape is as good as expired.
-        Ok(serde_json::from_str(&row.get::<String, _>("payload_json"))
-            .ok()
-            .map(|pending| (expires_at, pending)))
+        Ok(pending.map(|pending| (expires_at, pending)))
     }
 
     /// Puts an entry back under its token with its first expiry, for another try.
@@ -204,6 +251,7 @@ impl PendingStore {
     ) -> Result<(), sqlx::Error> {
         let payload = encode(&pending)?;
         let mut transaction = self.database.immediate_transaction().await?;
+        self.check_binding(&mut transaction, &pending).await?;
         sqlx::query(
             "INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3) \
              ON CONFLICT (token_hash) DO NOTHING",
@@ -338,6 +386,7 @@ pub(super) async fn login_second_factor(
         &state,
         &user,
         &body.code,
+        matches!(&first_factor, FirstFactor::Provider { profile, .. } if profile.provider == Provider::Github),
         request_id_value(request_id.as_ref()),
     )
     .await
@@ -409,7 +458,14 @@ pub(super) async fn login_second_factor(
             })?,
         FirstFactor::Provider { profile, link } => state
             .repository
-            .create_provider_session_audited(&user, profile, *link, rid, TimestampMillis::now())
+            .create_provider_session_audited(
+                &user,
+                profile,
+                &state.github_host,
+                *link,
+                rid,
+                TimestampMillis::now(),
+            )
             .await
             .map_err(|error| match error {
                 ProviderSignInError::Refused(_) => expired(),
@@ -432,6 +488,7 @@ async fn check_code(
     state: &AuthState,
     user: &AuthenticatedUser,
     code: &str,
+    github: bool,
     request_id: &str,
 ) -> Result<bool, IdentityError> {
     let code = code.trim().replace(' ', "");
@@ -439,7 +496,10 @@ async fn check_code(
         let Some(step) = totp_step(state, user, &code).await? else {
             return Ok(false);
         };
-        return state.repository.use_totp_step(user.id, step).await;
+        return state
+            .repository
+            .use_totp_step(user.id, step, github.then_some(&state.github_host))
+            .await;
     }
     let Some(codes_key) = recovery_code_key(state) else {
         return Ok(false);
@@ -450,6 +510,7 @@ async fn check_code(
             user.id,
             &code,
             &codes_key,
+            github.then_some(&state.github_host),
             request_id,
             TimestampMillis::now(),
         )
@@ -833,4 +894,128 @@ pub(super) async fn confirm_identity(
         instance,
         request_id,
     ))
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use orbit_platform::{GitHubHost, TestDatabase};
+
+    #[tokio::test]
+    async fn orphaned_serialized_github_pending_refuses_enterprise_and_preserves_token() {
+        for payload in [
+            r#"{"kind":"provider_handoff","flow":{"provider":"github","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Ok":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"}}}"#,
+            r#"{"kind":"provider_handoff","flow":{"provider":"google","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Ok":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"}}}"#,
+            r#"{"kind":"login","user":{"id":"01890f47-0000-7000-8000-000000000001","email":"a@example.test","display_name":"A"},"first_factor":{"kind":"provider","profile":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"},"link":true},"attempts":0}"#,
+        ] {
+            let db = TestDatabase::new().await.unwrap();
+            let default = GitHubHost::default();
+            let enterprise: GitHubHost = "https://enterprise.example".parse().unwrap();
+            crate::github_binding::bind(&db, &default).await.unwrap();
+            sqlx::query("INSERT INTO sign_in_providers (provider, client_id, client_secret, created_at, updated_at) VALUES ('github', 'id', $1, 0, 0)")
+                .bind(vec![1_u8]).execute(db.pool()).await.unwrap();
+            let store = PendingStore::new((*db).clone(), default.clone());
+            let pending: Pending = serde_json::from_str(payload).unwrap();
+            let token = store.insert(pending).await.unwrap().unwrap();
+            // Simulate a pre-upgrade database with the provider removed but its pending token left.
+            sqlx::query("DELETE FROM sign_in_providers WHERE provider = 'github'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM github_host_binding")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            assert!(matches!(
+                crate::github_binding::bind(&db, &enterprise).await,
+                Err(crate::github_binding::GitHubBindingError::Mismatch { .. })
+            ));
+            let wrong_store = PendingStore::new((*db).clone(), enterprise);
+            assert!(wrong_store.take(&token).await.is_err());
+            assert!(store.take(&token).await.unwrap().is_some());
+            assert!(store.take(&token).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn non_github_pending_works_with_another_binding() {
+        let db = TestDatabase::new().await.unwrap();
+        crate::github_binding::bind(&db, &GitHubHost::default())
+            .await
+            .unwrap();
+        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
+        let store = PendingStore::new((*db).clone(), host);
+        for payload in [
+            r#"{"kind":"provider_handoff","flow":{"provider":"google","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Ok":{"provider":"google","subject":"123","verified_email":null,"email":null,"display_name":"A"}}}"#,
+            r#"{"kind":"login","user":{"id":"01890f47-0000-7000-8000-000000000001","email":"a@example.test","display_name":"A"},"first_factor":{"kind":"password","password_hash":"hash","replacement_hash":null},"attempts":0}"#,
+        ] {
+            let token = store
+                .insert(serde_json::from_str(payload).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(store.take(&token).await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_pending_is_not_consumed_with_wrong_binding() {
+        let db = TestDatabase::new().await.unwrap();
+        crate::github_binding::bind(&db, &GitHubHost::default())
+            .await
+            .unwrap();
+        let token = "malformed-token";
+        sqlx::query(
+            "INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3)",
+        )
+        .bind(token_hash(token))
+        .bind(TimestampMillis::now().as_millis() + 60_000)
+        .bind(r#"{"kind":"provider_handoff","flow":{"provider":"google"}}"#)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
+        assert!(
+            PendingStore::new((*db).clone(), host)
+                .take(token)
+                .await
+                .is_err()
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_pending")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_pending_is_removed_even_with_wrong_binding() {
+        let db = TestDatabase::new().await.unwrap();
+        crate::github_binding::bind(&db, &GitHubHost::default())
+            .await
+            .unwrap();
+        let token = "expired-token";
+        sqlx::query(
+            "INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3)",
+        )
+        .bind(token_hash(token))
+        .bind(TimestampMillis::now().as_millis() - 1)
+        .bind("invalid")
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
+        assert!(
+            PendingStore::new((*db).clone(), host)
+                .take(token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_pending")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }

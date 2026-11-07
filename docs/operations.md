@@ -29,6 +29,7 @@ Orbit reads its configuration only from environment variables that start with `O
 | `ORBIT_RATE_LIMIT_*` | see notes | Request limits and email caps. See [Request limits and email caps](#request-limits-and-email-caps). |
 | `ORBIT_APP_KEY` | none | **Required.** The key for saved secrets: base64 of 32 random bytes. |
 | `ORBIT_APP_KEY_FILE` | none | The path of a file that contains the app key, instead of `ORBIT_APP_KEY`. Do not set both. |
+| `ORBIT_GITHUB_URL` | `https://github.com` | GitHub HTTPS web origin for sign-in and Apps. The database binds to one host; changing hosts is unsupported. See [GitHub host](github.md#github-host). |
 | `ORBIT_CLOUD` | `false` | `true` turns on Stripe billing for Orbit Cloud and requires the three Stripe variables below. See [Billing (Orbit Cloud)](#billing-orbit-cloud). |
 | `ORBIT_STRIPE_SECRET_KEY` | none | The Stripe secret key (`sk_live_…`, or `sk_test_…` for test mode). Only with `ORBIT_CLOUD=true`. |
 | `ORBIT_STRIPE_SECRET_KEY_FILE` | none | The path of a file that contains the Stripe secret key, instead of `ORBIT_STRIPE_SECRET_KEY`. Do not set both. |
@@ -145,7 +146,7 @@ To create the Google client:
 
 To create the GitHub client:
 
-1. Open GitHub **Settings → Developer settings → OAuth Apps → New OAuth App**. For an organization, use the organization settings.
+1. On the host selected by `ORBIT_GITHUB_URL`, open GitHub **Settings → Developer settings → OAuth Apps → New OAuth App**. For an organization, use the organization settings. See [GitHub host](github.md#github-host) for connectivity and host-binding requirements.
 2. Set **Homepage URL** to the public origin. Set **Authorization callback URL** to the GitHub callback URL.
 3. Register the app. Generate a client secret.
 4. Copy the client ID and the client secret.
@@ -226,7 +227,7 @@ A request, a live socket or a co-editing socket can go to any server; sticky ses
 ### Deployment
 
 - **Postgres:** one database with failover (a managed service, or Patroni). Connect directly or through a pooler in session mode: Orbit uses advisory locks and `LISTEN`/`NOTIFY`, which a pooler in transaction mode (PgBouncer `pool_mode = transaction`) breaks. Give each server its share of `max_connections` (each server uses its pools plus two connections: the ownership lock and the cluster listener).
-- **Configuration on every server:** the same `ORBIT_DATABASE_URL`, `ORBIT_APP_KEY` and `ORBIT_PUBLIC_ORIGIN`. `ORBIT_TRUSTED_PROXIES` holds the load balancer addresses.
+- **Configuration on every server:** the same `ORBIT_DATABASE_URL`, `ORBIT_APP_KEY`, `ORBIT_PUBLIC_ORIGIN` and `ORBIT_GITHUB_URL`. `ORBIT_TRUSTED_PROXIES` holds the load balancer addresses. Before using a non-default GitHub host, stop every old server sharing the database and upgrade it: older binaries ignore the host-binding lock, so a rolling upgrade cannot protect against their writes. See [GitHub host](github.md#github-host).
 - **Storage:** save a bucket in **Admin → Storage** and turn on attachments and backups in S3 before the second server starts. The local disk of a server then holds only temporary files (upload staging, backup downloads), so it can be an ephemeral volume. While other servers run, Orbit refuses to move attachments back to local disks (409 `storage_shared`), and a server that hears other servers while attachments are local logs a warning.
 - **Load balancer:** check `/health/ready` and remove a server on 503. Keep WebSockets open for a long time (idle timeout of 1 hour or more) for `/api/v1/workspaces/{id}/events`, the live socket (`/api/v1/workspaces/{id}/live`) and the co-editing socket of a page.
 - **Stopping a server:** set `ORBIT_SHUTDOWN_DELAY_SECONDS` (0 to 300, default 0) to a little more than the load balancer's health check interval. After SIGTERM, `/health/ready` reports 503 (`accepting`) at once and the server still serves for that long, then drains for up to 30 s. Give the orchestrator a stop timeout of at least the delay plus 30 s.

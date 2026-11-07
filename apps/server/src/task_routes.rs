@@ -1287,22 +1287,60 @@ pub(crate) async fn list_github_links(
         .get_task(workspace_id, task_id, actor_id)
         .await
         .map_err(|error| task_problem(error, instance.clone(), request_id.as_ref()))?;
-    let rows = sqlx::query("SELECT kind, repository || '#' || issue_number AS title, 'https://github.com/' || repository || CASE kind WHEN 'pull_request' THEN '/pull/' ELSE '/issues/' END || issue_number AS url, CASE WHEN sync_paused = 1 THEN 'paused' WHEN kind = 'pull_request' THEN pull_state ELSE 'active' END AS state, 1 AS source FROM github_issue_links WHERE workspace_id = $1 AND task_id = $2 UNION ALL SELECT 'pull_request' AS kind, title, url, state, 0 AS source FROM github_pull_links WHERE workspace_id = $3 AND task_id = $4 ORDER BY kind, title")
+    let rows = sqlx::query("SELECT kind, repository || '#' || issue_number AS title, repository, issue_number, NULL AS url, CASE WHEN sync_paused = 1 THEN 'paused' WHEN kind = 'pull_request' THEN pull_state ELSE 'active' END AS state, 1 AS source FROM github_issue_links WHERE workspace_id = $1 AND task_id = $2 UNION ALL SELECT 'pull_request' AS kind, title, NULL AS repository, NULL AS issue_number, url, state, 0 AS source FROM github_pull_links WHERE workspace_id = $3 AND task_id = $4 ORDER BY kind, title")
         .bind(workspace_id.to_string()).bind(task_id.to_string())
         .bind(workspace_id.to_string()).bind(task_id.to_string())
         .fetch_all(state.tasks.database().pool()).await
-        .map_err(|error| task_problem(TaskError::Unavailable(error), instance, request_id.as_ref()))?;
-    Ok(Json(
-        rows.into_iter()
-            .map(|row| GithubLink {
-                kind: row.get("kind"),
-                title: row.get("title"),
-                url: row.get("url"),
-                state: row.get("state"),
-                source: row.get::<i64, _>("source") != 0,
-            })
-            .collect(),
-    ))
+        .map_err(|error| task_problem(TaskError::Unavailable(error), instance.clone(), request_id.as_ref()))?;
+    if !rows.is_empty() {
+        crate::github_binding::check(state.tasks.database(), state.tasks.github_host())
+            .await
+            .map_err(|error| {
+                task_problem(
+                    crate::repositories::tasks::github_binding_error(error),
+                    instance.clone(),
+                    request_id.as_ref(),
+                )
+            })?;
+    }
+    let mut links = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kind: String = row.get("kind");
+        let source = row.get::<i64, _>("source") != 0;
+        let url = if source {
+            let repository: String = row.get("repository");
+            let (owner, repo) = repository
+                .split_once('/')
+                .filter(|(owner, repo)| {
+                    !owner.is_empty() && !repo.is_empty() && !repo.contains('/')
+                })
+                .ok_or_else(|| {
+                    task_problem(
+                        TaskError::Unavailable(sqlx::Error::Protocol(
+                            "invalid GitHub repository".into(),
+                        )),
+                        instance.clone(),
+                        request_id.as_ref(),
+                    )
+                })?;
+            let number: i64 = row.get("issue_number");
+            if kind == "pull_request" {
+                state.tasks.github_host().pull_url(owner, repo, number)
+            } else {
+                state.tasks.github_host().issue_url(owner, repo, number)
+            }
+        } else {
+            row.get("url")
+        };
+        links.push(GithubLink {
+            kind,
+            title: row.get("title"),
+            url,
+            state: row.get("state"),
+            source,
+        });
+    }
+    Ok(Json(links))
 }
 
 #[utoipa::path(get, path = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/activity", params(PageQuery, ("workspace_id" = String, Path), ("task_id" = String, Path)), responses((status = 200, body = Page<crate::audit::AuditEvent>)))]

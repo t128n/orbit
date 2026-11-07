@@ -172,6 +172,10 @@ impl App {
             .await
             .map_err(|error| AppError::Migration(error.to_string()))?;
 
+        crate::github_binding::bind(&database, &config.github)
+            .await
+            .map_err(|error| AppError::Config(error.to_string()))?;
+
         let integrity = IntegrityService::new(database.clone());
         integrity
             .quick()
@@ -191,6 +195,7 @@ impl App {
         }
 
         TaskRepository::new(database.clone())
+            .with_github_host(config.github.clone())
             .reconcile_github_attribution(orbit_platform::TimestampMillis::now())
             .await
             .map_err(|error| AppError::Database(error.to_string()))?;
@@ -381,11 +386,15 @@ impl App {
         );
         let router = metrics.instrument(production_router(
             ApiRoutes {
+                github_host: config.github.clone(),
                 billing: billing.clone(),
                 mcp: crate::mcp::router(
                     crate::mcp::McpState::new(
                         Arc::new(ApiTokenRepository::new(database.clone())),
-                        Arc::new(TaskRepository::new(database.clone())),
+                        Arc::new(
+                            TaskRepository::new(database.clone())
+                                .with_github_host(config.github.clone()),
+                        ),
                     )
                     .with_content(
                         Arc::new(crate::repositories::pages::PageRepository::new(
@@ -402,7 +411,10 @@ impl App {
                 public_api: crate::public_api::router(
                     crate::public_api::PublicApiState::new(
                         Arc::new(ApiTokenRepository::new(database.clone())),
-                        Arc::new(TaskRepository::new(database.clone())),
+                        Arc::new(
+                            TaskRepository::new(database.clone())
+                                .with_github_host(config.github.clone()),
+                        ),
                         &config.http.public_origin,
                     )
                     .with_pages(Arc::new(
@@ -412,6 +424,7 @@ impl App {
                 oauth: crate::oauth::router(oauth),
                 auth: {
                     let auth = auth
+                        .with_github_host(config.github.clone())
                         .with_mailer(mailer.clone())
                         .with_rate_limits(config.rate_limits)
                         .with_uploads(attachment_state.uploads.clone())
@@ -429,6 +442,7 @@ impl App {
                     cookie_mode,
                     backups.clone(),
                 )
+                .with_github_host(config.github.clone())
                 .with_mailer(mailer)
                 .with_rate_limits(config.rate_limits)
                 .with_object_storage(object_storage.clone(), blob_store.clone())
@@ -445,8 +459,15 @@ impl App {
                     attachment_state.uploads.clone(),
                     cookie_mode,
                 ),
-                tasks: TaskState::new(Arc::clone(&identity), cookie_mode)
-                    .with_socket_tickets(app_key.as_ref().map(SocketTickets::new)),
+                tasks: TaskState::with_repository(
+                    Arc::clone(&identity),
+                    Arc::new(
+                        TaskRepository::new(database.clone())
+                            .with_github_host(config.github.clone()),
+                    ),
+                    cookie_mode,
+                )
+                .with_socket_tickets(app_key.as_ref().map(SocketTickets::new)),
                 pages: PageState::new(Arc::clone(&identity), cookie_mode)
                     .with_socket_tickets(app_key.as_ref().map(SocketTickets::new)),
                 page_comments: PageCommentState::new(Arc::clone(&identity), cookie_mode),
@@ -470,8 +491,12 @@ impl App {
                 attachments: attachment_state.clone(),
                 integrations: IntegrationState::new(
                     Arc::new(ApiTokenRepository::new(database.clone())),
-                    Arc::new(TaskRepository::new(database.clone())),
+                    Arc::new(
+                        TaskRepository::new(database.clone())
+                            .with_github_host(config.github.clone()),
+                    ),
                 )
+                .with_github_host(config.github.clone())
                 .with_github_settings(
                     Arc::clone(&identity),
                     cookie_mode,

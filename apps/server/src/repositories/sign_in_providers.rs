@@ -178,6 +178,19 @@ async fn identity_owner(
         .transpose()
 }
 
+async fn check_github_binding(
+    transaction: &mut Transaction<'_, Any>,
+    provider: Provider,
+    host: &orbit_platform::GitHubHost,
+) -> Result<(), sqlx::Error> {
+    if provider == Provider::Github {
+        crate::github_binding::check_in_transaction(transaction, host)
+            .await
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    }
+    Ok(())
+}
+
 async fn has_provider(
     transaction: &mut Transaction<'_, Any>,
     user_id: Id,
@@ -233,10 +246,12 @@ impl IdentityRepository {
     pub async fn provider_account(
         &self,
         profile: &ProviderProfile,
+        github_host: &orbit_platform::GitHubHost,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<ProviderAccount, ProviderSignInError> {
         let mut transaction = self.database().immediate_transaction().await?;
+        check_github_binding(&mut transaction, profile.provider, github_host).await?;
         let owner = identity_owner(&mut transaction, profile.provider, &profile.subject).await?;
         let email_account = match (&owner, &profile.verified_email) {
             (None, Some(email)) => {
@@ -348,11 +363,13 @@ impl IdentityRepository {
         &self,
         user: &AuthenticatedUser,
         profile: &ProviderProfile,
+        github_host: &orbit_platform::GitHubHost,
         link: bool,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<IssuedSession, ProviderSignInError> {
         let mut transaction = self.database().immediate_transaction().await?;
+        check_github_binding(&mut transaction, profile.provider, github_host).await?;
         let active = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM users WHERE id = $1 AND suspended_at IS NULL",
         )
@@ -413,10 +430,12 @@ impl IdentityRepository {
         &self,
         user_id: Id,
         profile: &ProviderProfile,
+        github_host: &orbit_platform::GitHubHost,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<(), IdentityChangeError> {
         let mut transaction = self.database().immediate_transaction().await?;
+        check_github_binding(&mut transaction, profile.provider, github_host).await?;
         match identity_owner(&mut transaction, profile.provider, &profile.subject).await? {
             Some(owner) if owner == user_id => return Ok(()),
             Some(_) => return Err(IdentityChangeError::InUse),
@@ -445,10 +464,12 @@ impl IdentityRepository {
         session_id: Id,
         user_id: Id,
         profile: &ProviderProfile,
+        github_host: &orbit_platform::GitHubHost,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<(), IdentityChangeError> {
         let mut transaction = self.database().immediate_transaction().await?;
+        check_github_binding(&mut transaction, profile.provider, github_host).await?;
         if identity_owner(&mut transaction, profile.provider, &profile.subject).await?
             != Some(user_id)
         {
@@ -505,10 +526,12 @@ impl IdentityRepository {
         &self,
         user_id: Id,
         provider: Provider,
+        github_host: &orbit_platform::GitHubHost,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<(), IdentityChangeError> {
         let mut transaction = self.database().immediate_transaction().await?;
+        check_github_binding(&mut transaction, provider, github_host).await?;
         let deleted =
             sqlx::query("DELETE FROM user_identities WHERE user_id = $1 AND provider = $2")
                 .bind(user_id.to_string())
@@ -599,16 +622,23 @@ impl InstanceSettingsRepository {
     }
 
     /// Saves the OAuth client. `client_secret: None` keeps the saved secret.
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_sign_in_provider(
         &self,
         actor_id: Id,
         provider: Provider,
+        github_host: &orbit_platform::GitHubHost,
         client_id: &str,
         client_secret: Option<Vec<u8>>,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<(), SaveSignInProviderError> {
         let mut transaction = self.database.immediate_transaction().await?;
+        if provider == Provider::Github {
+            crate::github_binding::check_in_transaction(&mut transaction, github_host)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
         match client_secret {
             Some(secret) => {
                 sqlx::query(
@@ -660,10 +690,16 @@ impl InstanceSettingsRepository {
         &self,
         actor_id: Id,
         provider: Provider,
+        github_host: &orbit_platform::GitHubHost,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<(), sqlx::Error> {
         let mut transaction = self.database.immediate_transaction().await?;
+        if provider == Provider::Github {
+            crate::github_binding::check_in_transaction(&mut transaction, github_host)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
         let deleted = sqlx::query("DELETE FROM sign_in_providers WHERE provider = $1")
             .bind(provider.as_str())
             .execute(&mut *transaction)

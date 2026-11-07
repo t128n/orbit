@@ -9,7 +9,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use orbit_domain::Permission;
-use orbit_platform::{Flag, Id, Problem, RequestId, Row, TimestampMillis, generate_opaque_token};
+use orbit_platform::{
+    Flag, GitHubHost, Id, Problem, RequestId, Row, TimestampMillis, generate_opaque_token,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +69,7 @@ pub struct IntegrationState {
     tokens: Arc<ApiTokenRepository>,
     tasks: Arc<TaskRepository>,
     github_settings: Option<GithubSettings>,
+    github_host: GitHubHost,
 }
 
 #[derive(Clone)]
@@ -86,6 +89,7 @@ impl IntegrationState {
             tokens,
             tasks,
             github_settings: None,
+            github_host: GitHubHost::default(),
         }
     }
 
@@ -104,10 +108,48 @@ impl IntegrationState {
             public_origin,
             allow_request_origin,
             encryption_key,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("valid GitHub HTTP client"),
         });
         self
     }
+
+    #[must_use]
+    pub fn with_github_host(mut self, host: GitHubHost) -> Self {
+        self.github_host = host;
+        self
+    }
+}
+
+fn github_binding_error(id: Option<&RequestId>) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "github_host_mismatch",
+        "GitHub unavailable",
+        "The configured GitHub host does not match this database's binding.",
+        id,
+    )
+}
+
+async fn check_github_binding(
+    state: &IntegrationState,
+    id: Option<&RequestId>,
+) -> Result<(), ApiError> {
+    crate::github_binding::check(state.tasks.database(), &state.github_host)
+        .await
+        .map_err(|_| github_binding_error(id))
+}
+
+async fn check_github_binding_tx(
+    state: &IntegrationState,
+    tx: &mut Transaction<'_, Any>,
+    id: Option<&RequestId>,
+) -> Result<(), ApiError> {
+    crate::github_binding::check_in_transaction(tx, &state.github_host)
+        .await
+        .map_err(|_| github_binding_error(id))
 }
 
 pub fn integration_router(state: IntegrationState) -> Router {
@@ -348,6 +390,7 @@ pub(crate) async fn github_workspace_settings(
 ) -> Result<Json<GithubWorkspaceSettings>, ApiError> {
     let id = request_id.as_ref().map(|Extension(id)| id);
     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
+    check_github_binding(&state, id).await?;
     let app: Option<String> =
         sqlx::query_scalar("SELECT slug FROM github_apps WHERE workspace_id = $1")
             .bind(&workspace)
@@ -357,7 +400,7 @@ pub(crate) async fn github_workspace_settings(
     Ok(Json(GithubWorkspaceSettings {
         install_url: app
             .as_ref()
-            .map(|slug| format!("https://github.com/apps/{slug}/installations/new")),
+            .map(|slug| state.github_host.installation_url(slug)),
         app_slug: app,
         repositories: github_repositories(&state, &workspace, id).await?,
         can_manage,
@@ -378,6 +421,7 @@ pub(crate) async fn github_project_settings(
     let request_id = request_id.as_ref().map(|Extension(id)| id);
     let (_, _, can_manage) =
         github_project_access(&state, &headers, &workspace, &project, request_id).await?;
+    check_github_binding(&state, request_id).await?;
     let app: Option<String> =
         sqlx::query_scalar("SELECT slug FROM github_apps WHERE workspace_id = $1")
             .bind(&workspace)
@@ -389,7 +433,7 @@ pub(crate) async fn github_project_settings(
     Ok(Json(GithubProjectSettings {
         install_url: app
             .as_ref()
-            .map(|slug| format!("https://github.com/apps/{slug}/installations/new")),
+            .map(|slug| state.github_host.installation_url(slug)),
         app_slug: app,
         repository: connection.as_ref().map(|row| row.get("repository")),
         label: connection.as_ref().map(|row| row.get("label")),
@@ -430,6 +474,7 @@ pub(crate) async fn save_github_project_connection(
     let (_, _, can_manage) =
         github_project_access(&state, &headers, &workspace, &project, id).await?;
     require_github_manager(can_manage, id)?;
+    check_github_binding(&state, id).await?;
     let label = body.label.trim();
     if !valid_repository(&body.repository) || label.is_empty() || label.chars().count() > 50 {
         return Err(ApiError::new(
@@ -457,6 +502,7 @@ pub(crate) async fn save_github_project_connection(
         .immediate_transaction()
         .await
         .map_err(|_| ApiError::internal(id))?;
+    check_github_binding_tx(&state, &mut tx, id).await?;
     let changed = sqlx::query("INSERT INTO github_project_connections (workspace_id, project_id, installation_id, repository, label) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(project_id) DO UPDATE SET installation_id = excluded.installation_id, repository = excluded.repository, label = excluded.label WHERE github_project_connections.installation_id != excluded.installation_id OR github_project_connections.repository != excluded.repository OR github_project_connections.label != excluded.label")
         .bind(&workspace).bind(&project).bind(body.installation_id).bind(&body.repository).bind(label).execute(&mut *tx).await;
     match changed {
@@ -496,12 +542,14 @@ pub(crate) async fn delete_github_project_connection(
     let (_, _, can_manage) =
         github_project_access(&state, &headers, &workspace, &project, id).await?;
     require_github_manager(can_manage, id)?;
+    check_github_binding(&state, id).await?;
     let mut tx = state
         .tasks
         .database()
         .immediate_transaction()
         .await
         .map_err(|_| ApiError::internal(id))?;
+    check_github_binding_tx(&state, &mut tx, id).await?;
     let removed = sqlx::query(
         "DELETE FROM github_project_connections WHERE workspace_id = $1 AND project_id = $2",
     )
@@ -569,6 +617,7 @@ pub(crate) async fn start_github_manifest(
     app_key(settings, id)?;
     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
     require_github_manager(can_manage, id)?;
+    check_github_binding(&state, id).await?;
     let origin = github_registration_origin(settings, &headers, id)?;
     let organization = body.organization.as_deref().unwrap_or("").trim();
     if !organization.is_empty()
@@ -604,22 +653,29 @@ pub(crate) async fn start_github_manifest(
     }
     let token = generate_opaque_token();
     let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let mut tx = state
+        .tasks
+        .database()
+        .immediate_transaction()
+        .await
+        .map_err(|_| ApiError::internal(id))?;
+    check_github_binding_tx(&state, &mut tx, id).await?;
     sqlx::query("DELETE FROM github_app_registrations WHERE expires_at <= $1")
         .bind(TimestampMillis::now().as_millis())
-        .execute(state.tasks.database().pool())
+        .execute(&mut *tx)
         .await
         .map_err(|_| ApiError::internal(id))?;
     sqlx::query("INSERT INTO github_app_registrations (state_hash, workspace_id, expires_at, public_origin) VALUES ($1, $2, $3, $4) ON CONFLICT(workspace_id) DO UPDATE SET state_hash = excluded.state_hash, expires_at = excluded.expires_at, public_origin = excluded.public_origin")
          .bind(hash.to_vec()).bind(&workspace).bind(TimestampMillis::now().as_millis() + 3_600_000).bind(&origin)
-        .execute(state.tasks.database().pool()).await.map_err(|_| ApiError::internal(id))?;
+        .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
+    tx.commit().await.map_err(|_| ApiError::internal(id))?;
     Ok(Json(GithubManifestStart {
-        action: if organization.is_empty() {
-            format!("https://github.com/settings/apps/new?state={token}")
-        } else {
-            format!(
-                "https://github.com/organizations/{organization}/settings/apps/new?state={token}"
-            )
-        },
+        action: format!(
+            "{}?state={token}",
+            state
+                .github_host
+                .manifest_url((!organization.is_empty()).then_some(organization))
+        ),
         manifest: serde_json::json!({
             "name": "Orbit",
             "url": origin,
@@ -659,6 +715,7 @@ pub(crate) async fn github_manifest_callback(
     })?;
     let settings = github_settings_context(&state, id)?;
     let key = app_key(settings, id)?;
+    check_github_binding(&state, id).await?;
     if query.state.len() > 200 || query.code.len() > 200 || query.code.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -688,12 +745,16 @@ pub(crate) async fn github_manifest_callback(
     })?;
     let workspace: String = pending.get("workspace_id");
     let registered_origin: String = pending.get("public_origin");
+    let mut conversion_url =
+        reqwest::Url::parse(&state.github_host.rest_base()).map_err(|_| ApiError::internal(id))?;
+    conversion_url
+        .path_segments_mut()
+        .map_err(|_| ApiError::internal(id))?
+        .pop_if_empty()
+        .extend(["app-manifests", query.code.as_str(), "conversions"]);
     let response = settings
         .client
-        .post(format!(
-            "https://api.github.com/app-manifests/{}/conversions",
-            query.code
-        ))
+        .post(conversion_url)
         .header("User-Agent", "Orbit")
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -758,6 +819,7 @@ async fn store_github_app(
         .immediate_transaction()
         .await
         .map_err(|_| ApiError::internal(id))?;
+    check_github_binding_tx(state, &mut tx, id).await?;
     let consumed = sqlx::query("DELETE FROM github_app_registrations WHERE state_hash = $1 AND workspace_id = $2 AND expires_at > $3")
         .bind(hash.to_vec()).bind(workspace).bind(TimestampMillis::now().as_millis())
         .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
@@ -813,6 +875,7 @@ async fn github_webhook_from_database(
 ) -> Result<StatusCode, ApiError> {
     let request_id = request.extensions().get::<RequestId>().cloned();
     let id = request_id.as_ref();
+    check_github_binding(state, id).await?;
     if request
         .headers()
         .get("x-github-event")
@@ -1017,6 +1080,7 @@ async fn github_webhook_from_database(
                 .immediate_transaction()
                 .await
                 .map_err(|_| ApiError::internal(id))?;
+            check_github_binding_tx(state, &mut tx, id).await?;
             let paused = sqlx::query("UPDATE github_issue_links SET sync_paused = 1 WHERE workspace_id = $1 AND repository = $2 AND issue_number = $3 AND kind = $4 AND sync_paused = 0")
                 .bind(&workspace).bind(repository).bind(number).bind(kind)
                 .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
@@ -1078,6 +1142,7 @@ async fn github_webhook_from_database(
     } else {
         "open"
     };
+    check_github_binding(state, id).await?;
     let synced = state
         .tasks
         .sync_github_work_item(
@@ -1156,6 +1221,7 @@ async fn update_github_installation(
         .immediate_transaction()
         .await
         .map_err(|_| ApiError::internal(request_id))?;
+    check_github_binding_tx(state, &mut tx, request_id).await?;
     let mut changed = false;
     if event == "installation" && action == "deleted" {
         changed |= sqlx::query(
