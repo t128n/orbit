@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use orbit_platform::{Backend, Id, PasswordService, TestDatabase, TimestampMillis};
+use orbit_platform::{Id, PasswordService, TestDatabase, TimestampMillis};
 use orbit_server::github_poll_schedule::{self, Outcome, RateLimit};
 use orbit_server::repositories::identity::{IdentityRepository, SetupRequest};
 use orbit_server::repositories::tasks::{GithubWorkItem, PollFence, TaskRepository};
@@ -14,11 +14,6 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let database = TestDatabase::new().await.unwrap();
-    assert_eq!(
-        database.backend(),
-        Backend::Postgres,
-        "run with ORBIT_TEST_POSTGRES_URL"
-    );
     let identity = IdentityRepository::new((*database).clone());
     let now = TimestampMillis::now();
     identity

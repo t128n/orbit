@@ -27,7 +27,7 @@ fn openapi_generation_is_byte_stable_and_covers_public_routes() {
 
     let document: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(document["info"]["version"], CONTRACT_ID);
-    assert_eq!(document["paths"].as_object().unwrap().len(), 247);
+    assert_eq!(document["paths"].as_object().unwrap().len(), 248);
     let operation_count: usize = document["paths"]
         .as_object()
         .unwrap()
@@ -42,7 +42,7 @@ fn openapi_generation_is_byte_stable_and_covers_public_routes() {
                 .count()
         })
         .sum();
-    assert_eq!(operation_count, 318);
+    assert_eq!(operation_count, 320);
     for path in [
         "/api/v1/setup/status",
         "/api/v1/auth/me",
@@ -1389,7 +1389,7 @@ fn sub_issue_contract_is_documented() {
 /// The `(path, method)` pairs of `orbit_server::public_api::router`, read from its source: Axum
 /// cannot list a router's routes.
 fn public_api_router_routes() -> BTreeSet<(String, String)> {
-    let source = include_str!("../src/public_api.rs");
+    let source = include_str!("../src/public_api.rs").replace("\r\n", "\n");
     let router = source
         .split_once("pub fn router(")
         .and_then(|(_, rest)| rest.split_once("\n}\n"))

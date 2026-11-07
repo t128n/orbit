@@ -185,10 +185,6 @@ async fn github_workspace_polling_settings_before_app_registration() {
             r#"{"sync_mode":"polling","poll_interval_minutes":16}"#,
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
-        (
-            r#"{"sync_mode":"polling","poll_interval_minutes":1}"#,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
     ] {
         let response = app
             .clone()
@@ -216,7 +212,7 @@ async fn github_workspace_polling_settings_before_app_registration() {
                 .header(header::ORIGIN, "https://orbit.test")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"sync_mode":"webhooks","poll_interval_minutes":7}"#,
+                    r#"{"sync_mode":"polling","poll_interval_minutes":7}"#,
                 ))
                 .unwrap(),
         )
@@ -230,7 +226,7 @@ async fn github_workspace_polling_settings_before_app_registration() {
     .fetch_one(fixture.database.pool())
     .await
     .unwrap();
-    assert_eq!(epoch, 1);
+    assert_eq!(epoch, 2);
     let get = app
         .oneshot(
             Request::builder()
@@ -242,7 +238,7 @@ async fn github_workspace_polling_settings_before_app_registration() {
         .await
         .unwrap();
     let settings = response_json(get).await;
-    assert_eq!(settings["sync_mode"], "webhooks");
+    assert_eq!(settings["sync_mode"], "polling");
     assert_eq!(settings["poll_interval_minutes"], 7);
     assert!(settings["app_slug"].is_null());
 }
@@ -285,7 +281,7 @@ async fn polling_rejects_unsigned_and_ignores_signed_installation_events() {
     );
     assert_eq!(
         app.clone()
-            .oneshot(github_request("installation", payload, true))
+            .oneshot(github_request("installation", payload.clone(), true))
             .await
             .unwrap()
             .status(),
@@ -300,6 +296,7 @@ async fn polling_rejects_unsigned_and_ignores_signed_installation_events() {
     assert_eq!(count, 0);
     let path = format!("/api/v1/workspaces/{}/github", fixture.workspace_id);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
@@ -314,7 +311,18 @@ async fn polling_rejects_unsigned_and_ignores_signed_installation_events() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
+    // While switching to webhooks, deliveries return 503 so GitHub automatically retries.
+    let in_flight = app
+        .clone()
+        .oneshot(github_request("installation", payload, true))
+        .await
+        .unwrap();
+    assert_eq!(in_flight.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_json(in_flight).await["code"],
+        "github_mode_transition"
+    );
 }
 
 #[tokio::test]

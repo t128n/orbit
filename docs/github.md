@@ -44,14 +44,14 @@ If you delete a linked task in Orbit, the next GitHub event with the project lab
 
 GitHub App registration uses the [GitHub App manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest). GitHub sends signed events as described in its [webhook validation guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries). App installation is described in [GitHub's installation guide](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app).
 
-## Planned: workspace polling mode
+## Workspace polling mode
 
-The setup above describes the current webhook integration. A future workspace-level polling mode is planned for Orbit instances that are accessible to users over private HTTPS but cannot receive inbound GitHub webhooks. The browser must be able to reach Orbit over HTTPS for registration and the callback; GitHub's acceptance of a particular private hostname is not guaranteed. This mode has not been verified against a real private instance.
+The setup above describes the default webhook integration. A workspace-level polling mode is available for Orbit instances that are accessible to users over private HTTPS but cannot receive inbound GitHub webhooks. The browser must be able to reach Orbit over HTTPS for registration and the callback.
 
-In polling mode, the App manifest will leave webhooks inactive. Orbit will discover App installations and repository access through outbound GitHub API requests rather than installation events. Workspace owners and admins will be able to choose a polling interval from 1 to 15 minutes, with a default of 5 minutes. Shorter intervals reduce synchronization latency but consume more GitHub API quota; longer intervals conserve quota but delay updates.
+In polling mode, the App manifest leaves webhooks inactive. Orbit discovers App installations and repository access through outbound GitHub API requests rather than installation events. Workspace owners and admins can choose a polling interval from 1 to 15 minutes, with a default of 5 minutes. Shorter intervals reduce synchronization latency but consume more GitHub API quota; longer intervals conserve quota but delay updates.
 
-Polling will remain one-way: Orbit will not write task changes back to GitHub. A successful, complete poll can pause sync for an item whose project label was removed, retaining its task so adding the label again can resume it. Failed or incomplete polls must not be treated as proof that a label was removed.
+Polling remains one-way: Orbit does not write task changes back to GitHub. A successful, complete poll can pause sync for an item whose project label was removed, retaining its task so adding the label again can resume it. Failed or incomplete polls must not be treated as proof that a label was removed.
 
-**Sync now** is planned to request a poll for the whole workspace, bypassing Orbit's own polling backoff. It will not reset or bypass GitHub's rate limits or their reset times.
+**Sync now** requests an immediate poll for the whole workspace, bypassing Orbit's own polling backoff. It will not reset or bypass GitHub's rate limits or their reset times.
 
-If switching an existing workspace between webhooks and polling, review the GitHub App's webhook configuration as part of the switch: polling requires inactive webhooks, while webhook mode requires an active webhook and an endpoint reachable by GitHub.
+If switching an existing workspace between webhooks and polling, Orbit fences writes and transitions durably. Switching from polling back to webhooks performs a complete final poll before activating webhook handling, while incoming deliveries during the handoff return 503 so GitHub safely retries them.

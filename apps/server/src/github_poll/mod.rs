@@ -479,6 +479,7 @@ fn app_jwt(app_id: i64, encrypted_key: &[u8], key: &[u8; 32]) -> Result<String, 
 
 /// Collect one workspace observation, without applying any effects.
 /// `base_url` is normally `https://api.github.com/`; override only with a trusted test server.
+#[allow(dead_code)]
 pub(crate) async fn poll_workspace(
     app_id: i64,
     encrypted_key: &[u8],

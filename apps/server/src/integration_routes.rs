@@ -266,16 +266,6 @@ pub(crate) async fn github_sync_status(
     }))
 }
 
-fn polling_unavailable(id: Option<&RequestId>) -> ApiError {
-    ApiError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "github_polling_unavailable",
-        "GitHub polling unavailable",
-        "Polling is temporarily unavailable until webhook ordering is safe.",
-        id,
-    )
-}
-
 #[utoipa::path(post, path = "/api/v1/workspaces/{workspace_id}/github/sync", params(("workspace_id" = String, Path)), responses((status = 202, description = "Sync request queued; subject to polling cooldown and rate limits")))]
 pub(crate) async fn github_sync_now(
     State(state): State<IntegrationState>,
@@ -532,11 +522,6 @@ pub(crate) async fn save_github_workspace_settings(
             "Choose webhooks or polling and an interval from 1 to 15 minutes.",
             id,
         ));
-    }
-    // Poll snapshots can currently race webhook writes, including deliveries already in flight.
-    // A lease only fences other pollers; it does not establish ordering with webhooks.
-    if body.sync_mode == "polling" {
-        return Err(polling_unavailable(id));
     }
     request_github_settings_transition(state.tasks.database(), &workspace, &body)
         .await
@@ -1169,14 +1154,31 @@ async fn github_webhook_from_database(
             )
         }
     })?;
-    let mode: Option<(String, i64)> = sqlx::query_as(
-        "SELECT sync_mode, mode_epoch FROM github_workspace_settings WHERE workspace_id = $1",
+    let settings = sqlx::query(
+        "SELECT s.sync_mode, s.mode_epoch, t.target_mode FROM github_workspace_settings s LEFT JOIN github_poll_transition t ON t.workspace_id = s.workspace_id WHERE s.workspace_id = $1",
     )
     .bind(&workspace)
     .fetch_optional(state.tasks.database().pool())
     .await
     .map_err(|_| ApiError::internal(id))?;
-    let (mode, epoch) = mode.unwrap_or_else(|| ("webhooks".to_owned(), 1));
+    let (mode, epoch, pending_target): (String, i64, Option<String>) = match settings {
+        Some(row) => (
+            row.get("sync_mode"),
+            row.get("mode_epoch"),
+            row.try_get("target_mode").ok(),
+        ),
+        None => ("webhooks".to_owned(), 1, None),
+    };
+    if pending_target.as_deref() == Some("webhooks") {
+        tracing::info!(workspace_id = %workspace, "retry: workspace in transition to webhooks");
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "github_mode_transition",
+            "GitHub mode transition in progress",
+            "Orbit is completing the final poll before switching to webhooks. Delivery will be retried.",
+            id,
+        ));
+    }
     if mode == "polling" {
         tracing::info!(workspace_id = %workspace, "ignored: workspace in polling mode");
         return Ok(StatusCode::ACCEPTED);
@@ -1400,6 +1402,7 @@ async fn github_webhook_from_database(
 }
 
 /// Pause a linked item when no configured project label matches an observation.
+#[allow(dead_code)]
 pub(crate) async fn pause_github_work_item(
     state: &IntegrationState,
     workspace: &str,
