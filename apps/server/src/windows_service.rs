@@ -107,9 +107,9 @@ pub fn uninstall() -> Result<String, String> {
         )
     })?;
     if status.current_state != ServiceState::Stopped {
-        service
-            .stop()
-            .map_err(|error| format!("stopping the {SERVICE_NAME} service: {}", describe(&error)))?;
+        service.stop().map_err(|error| {
+            format!("stopping the {SERVICE_NAME} service: {}", describe(&error))
+        })?;
     }
     Ok(format!(
         "removed the {SERVICE_NAME} service registration (it stays until Windows finishes \
