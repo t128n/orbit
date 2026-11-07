@@ -9,11 +9,12 @@ use orbit_platform::{
     HttpPlatformLayer, OriginPolicy, PasswordService, TestDatabase, TimestampMillis,
 };
 use orbit_server::auth_routes::CookieMode;
+use orbit_server::github_poll_schedule;
 use orbit_server::integration_routes::{IntegrationState, integration_router};
 use orbit_server::repositories::api_tokens::{ApiTokenRepository, ApiTokenScope};
 use orbit_server::repositories::identity::{IdentityRepository, SetupRequest};
 use orbit_server::repositories::tasks::{
-    CommentContent, GithubWorkItem, TaskRepository, TokenActor,
+    CommentContent, GithubWorkItem, PollFence, TaskRepository, TokenActor,
 };
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -79,6 +80,248 @@ async fn enterprise_manifest_and_binding_guard() {
             .unwrap()
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn polling_observation_requires_current_claim_epoch_and_identity() {
+    let fixture = fixture().await;
+    let workspace = fixture.workspace_id.to_string();
+    sqlx::query("INSERT INTO github_workspace_settings (workspace_id, sync_mode) VALUES ($1, 'polling')")
+        .bind(&workspace)
+        .execute(fixture.database.pool())
+        .await
+        .unwrap();
+    let claim = github_poll_schedule::try_claim(&fixture.database, &workspace, "worker", 600_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = PollFence::from(&claim);
+    let tasks = TaskRepository::new((*fixture.database).clone());
+    let item = || GithubWorkItem {
+        repository: "acme/repo".to_owned(),
+        number: 123,
+        project_id: fixture.project_id,
+        title: "Observed".to_owned(),
+        description: String::new(),
+        kind: "issue",
+        state: "open",
+        state_changed: false,
+    };
+    let mut stale = Vec::new();
+    let mut wrong = fence.clone();
+    wrong.mode_epoch += 1;
+    stale.push(wrong);
+    let mut wrong = fence.clone();
+    wrong.config_version += 1;
+    stale.push(wrong);
+    let mut wrong = fence.clone();
+    wrong.generation += 1;
+    stale.push(wrong);
+    let mut wrong = fence.clone();
+    wrong.owner = "other".to_owned();
+    stale.push(wrong);
+    let mut wrong = fence.clone();
+    wrong.workspace_id = "other".to_owned();
+    stale.push(wrong);
+    for wrong in &stale {
+        assert!(tasks.observe_github_work_item(fixture.workspace_id, fixture.user_id, item(), "poll", TimestampMillis::now(), wrong).await.unwrap().is_none());
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_issue_links WHERE workspace_id = $1")
+        .bind(&workspace).fetch_one(fixture.database.pool()).await.unwrap();
+    assert_eq!(count, 0);
+
+    // A mode round trip invalidates the claim even if its config version is unchanged.
+    sqlx::query("UPDATE github_workspace_settings SET mode_epoch = mode_epoch + 2 WHERE workspace_id = $1")
+        .bind(&workspace).execute(fixture.database.pool()).await.unwrap();
+    assert!(tasks.observe_github_work_item(fixture.workspace_id, fixture.user_id, item(), "poll", TimestampMillis::now(), &fence).await.unwrap().is_none());
+    let mut current = fence.clone();
+    current.mode_epoch += 2;
+    assert!(tasks.observe_github_work_item(fixture.workspace_id, fixture.user_id, item(), "poll", TimestampMillis::now(), &current).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn github_workspace_polling_settings_before_app_registration() {
+    let fixture = fixture().await;
+    let state = IntegrationState::new(
+        Arc::new(fixture.tokens.clone()),
+        Arc::new(TaskRepository::new((*fixture.database).clone())),
+    )
+    .with_github_settings(
+        Arc::new(IdentityRepository::new((*fixture.database).clone())),
+        CookieMode::secure(),
+        "https://orbit.test".to_owned(),
+        false,
+        None,
+    );
+    let app = integration_router(state).layer(HttpPlatformLayer::new(OriginPolicy::new(
+        "https://orbit.test",
+    )));
+    let path = format!("/api/v1/workspaces/{}/github", fixture.workspace_id);
+    let get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header(header::COOKIE, &fixture.session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let settings = response_json(get).await;
+    assert_eq!(settings["sync_mode"], "webhooks");
+    assert_eq!(settings["poll_interval_minutes"], 5);
+    for (body, expected) in [
+        (
+            r#"{"sync_mode":"webhook","poll_interval_minutes":5}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            r#"{"sync_mode":"polling","poll_interval_minutes":0}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            r#"{"sync_mode":"polling","poll_interval_minutes":16}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&path)
+                    .header(header::COOKIE, &fixture.session_cookie)
+                    .header(header::ORIGIN, "https://orbit.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&path)
+                .header(header::COOKIE, &fixture.session_cookie)
+                .header(header::ORIGIN, "https://orbit.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"sync_mode":"polling","poll_interval_minutes":7}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let epoch: i64 = sqlx::query_scalar(
+        "SELECT mode_epoch FROM github_workspace_settings WHERE workspace_id = $1",
+    )
+    .bind(fixture.workspace_id.to_string())
+    .fetch_one(fixture.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(epoch, 2);
+    let get = app
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header(header::COOKIE, &fixture.session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let settings = response_json(get).await;
+    assert_eq!(settings["sync_mode"], "polling");
+    assert_eq!(settings["poll_interval_minutes"], 7);
+    assert!(settings["app_slug"].is_null());
+}
+
+#[tokio::test]
+async fn polling_rejects_unsigned_and_ignores_signed_installation_events() {
+    let fixture = fixture().await;
+    let key = [7u8; 32];
+    let state = IntegrationState::new(
+        Arc::new(fixture.tokens.clone()),
+        Arc::new(TaskRepository::new((*fixture.database).clone())),
+    )
+    .with_github_settings(
+        Arc::new(IdentityRepository::new((*fixture.database).clone())),
+        CookieMode::secure(),
+        "https://orbit.test".to_owned(),
+        false,
+        Some(key),
+    );
+    let app = integration_router(state).layer(HttpPlatformLayer::new(OriginPolicy::new(
+        "https://orbit.test",
+    )));
+    sqlx::query("INSERT INTO github_apps (workspace_id, app_id, slug, private_key_encrypted, webhook_secret_encrypted, created_at) VALUES ($1, $2, $3, $4, $5, $6)")
+        .bind(fixture.workspace_id.to_string()).bind(77_i64).bind("orbit-test").bind(encrypt_for_test(&key, "private-key")).bind(encrypt_for_test(&key, "hook-secret")).bind(TimestampMillis::now().as_millis()).execute(fixture.database.pool()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO github_workspace_settings (workspace_id, sync_mode) VALUES ($1, 'polling')",
+    )
+    .bind(fixture.workspace_id.to_string())
+    .execute(fixture.database.pool())
+    .await
+    .unwrap();
+    let payload = json!({"action":"created","installation":{"id":1234,"app_id":77,"account":{"login":"acme"}},"repositories":[{"full_name":"acme/repo"}]});
+    assert_eq!(
+        app.clone()
+            .oneshot(github_request("installation", payload.clone(), false))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(github_request("installation", payload.clone(), true))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM github_installations WHERE workspace_id = $1")
+            .bind(fixture.workspace_id.to_string())
+            .fetch_one(fixture.database.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    let path = format!("/api/v1/workspaces/{}/github", fixture.workspace_id);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header(header::COOKIE, &fixture.session_cookie)
+                .header(header::ORIGIN, "https://orbit.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"sync_mode":"webhooks","poll_interval_minutes":5}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // While switching to webhooks, deliveries return 503 so GitHub automatically retries.
+    let in_flight = app
+        .clone()
+        .oneshot(github_request("installation", payload, true))
+        .await
+        .unwrap();
+    assert_eq!(in_flight.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_json(in_flight).await["code"],
+        "github_mode_transition"
     );
 }
 
@@ -368,6 +611,16 @@ async fn database_github_app_routes_issues_without_orbit_tokens() {
         .await
         .unwrap();
     assert_eq!(second_link.status(), StatusCode::OK);
+    // The first connection creates the default settings row; the second changes its
+    // version. The rejected duplicate must not invalidate a poll.
+    let config_version: i64 = sqlx::query_scalar(
+        "SELECT config_version FROM github_workspace_settings WHERE workspace_id = $1",
+    )
+    .bind(fixture.workspace_id.to_string())
+    .fetch_one(fixture.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(config_version, 2);
     let connection_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1 AND action = 'github.connection.updated'")
         .bind(fixture.workspace_id.to_string()).fetch_one(fixture.database.pool()).await.unwrap();
     assert_eq!(connection_events, 2);

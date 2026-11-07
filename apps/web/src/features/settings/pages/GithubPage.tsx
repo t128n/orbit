@@ -6,6 +6,8 @@ import { SettingsCard } from '@/components/common/SettingsCard'
 import { useStartGithubManifest, useGithubWorkspaceSettings } from '@/features/tasks/api/github'
 import { useWorkspace } from '@/features/workspaces/workspaceContext'
 import { loadFailed } from '@/lib/connection'
+import { useMutation } from '@tanstack/react-query'
+import { saveGithubSyncSettings, syncGithubNow, type SyncMode } from './GithubPageApi'
 
 export function GithubPage() {
   const { workspace } = useWorkspace()
@@ -40,6 +42,7 @@ export function GithubPage() {
   const settings = query.data
 
   return <SettingsCard title="GitHub" description="Manage the GitHub App for this workspace. Connect repositories to projects in each project's settings.">
+    <SyncControls key={`${workspace.id}:${(settings as { sync_mode?: string }).sync_mode}:${(settings as { poll_interval_minutes?: number }).poll_interval_minutes}`} workspaceId={workspace.id} settings={settings} refetch={query.refetch} />
     {!settings.app_slug ? (
       <div className="flex flex-col items-start gap-2">
         <p className="text-sm text-muted-foreground">Register a GitHub App from Orbit. GitHub will return you to this workspace.</p>
@@ -67,4 +70,33 @@ export function GithubPage() {
       <p className="text-sm text-muted-foreground">After installation, open a project's settings to select a repository and issue label.</p>
     </div>}
   </SettingsCard>
+}
+
+function SyncControls({ workspaceId, settings, refetch }: { workspaceId: string; settings: { can_manage: boolean }; refetch: () => Promise<unknown> }) {
+  const current = settings as typeof settings & { sync_mode?: SyncMode; poll_interval_minutes?: number }
+  const [mode, setMode] = useState<SyncMode>(current.sync_mode ?? 'webhooks')
+  const [interval, setInterval] = useState(String(current.poll_interval_minutes ?? 5))
+  const valid = /^\d+$/.test(interval) && Number(interval) >= 1 && Number(interval) <= 15
+  const save = useMutation({ mutationFn: () => saveGithubSyncSettings(workspaceId, { sync_mode: mode, poll_interval_minutes: Number(interval) }), onSuccess: () => refetch() })
+  const sync = useMutation({ mutationFn: () => syncGithubNow(workspaceId), onSuccess: () => refetch() })
+  const available = current.sync_mode === 'webhooks' || current.sync_mode === 'polling'
+  return <section className="mb-6 grid gap-3" aria-label="GitHub sync">
+    <h3 className="text-sm font-medium">GitHub sync</h3>
+    {!available ? <p className="text-sm text-muted-foreground">Sync settings are not available from this server.</p> : <>
+      <fieldset disabled={!settings.can_manage || save.isPending} className="grid gap-2">
+        <legend className="text-sm font-medium">Sync mode</legend>
+        <label className="text-sm"><input type="radio" name="github-sync-mode" checked={mode === 'webhooks'} onChange={() => setMode('webhooks')} /> Webhooks</label>
+        <label className="text-sm"><input type="radio" name="github-sync-mode" checked={mode === 'polling'} onChange={() => setMode('polling')} /> Polling</label>
+        <Label htmlFor="github-poll-interval">Polling interval (1–15 minutes)</Label>
+        <Input id="github-poll-interval" type="number" min={1} max={15} step={1} value={interval} onChange={(event) => setInterval(event.target.value)} />
+      </fieldset>
+      {!valid ? <p className="text-xs text-destructive">Enter a whole number from 1 to 15.</p> : null}
+      {settings.can_manage ? <div className="flex flex-wrap gap-2"><Button disabled={!valid || save.isPending} onClick={() => save.mutate()}>Save sync settings</Button><Button variant="outline" disabled={sync.isPending} onClick={() => sync.mutate()}>Sync now</Button></div> : <p className="text-sm text-muted-foreground">Only workspace owners and admins can change settings or sync now.</p>}
+      {save.isSuccess ? <p className="text-sm">Sync settings saved.</p> : null}
+      {save.isError ? <p role="alert" className="text-xs text-destructive">{save.error instanceof Error ? save.error.message : 'Could not save sync settings.'}</p> : null}
+      {sync.isError ? <p role="alert" className="text-xs text-destructive">{sync.error instanceof Error ? sync.error.message : 'Sync could not start.'}</p> : null}
+      {sync.isSuccess ? <p className="text-sm" role="status">Sync request completed.{sync.data == null ? '' : ` Result: ${JSON.stringify(sync.data)}`}</p> : null}
+    </>}
+    <p className="text-sm text-muted-foreground">Sync status and backoff are not available from this server.</p>
+  </section>
 }

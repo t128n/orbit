@@ -148,6 +148,9 @@ pub const CONTRACT_ID: &str = "orbit-api-v1";
         crate::integration_routes::github_webhook,
         crate::integration_routes::github_manifest_callback,
         crate::integration_routes::github_workspace_settings,
+        crate::integration_routes::save_github_workspace_settings,
+        crate::integration_routes::github_sync_status,
+        crate::integration_routes::github_sync_now,
         crate::integration_routes::github_project_settings,
         crate::integration_routes::save_github_project_connection,
         crate::integration_routes::delete_github_project_connection,
@@ -791,6 +794,19 @@ fn problem_responses(operation_id: &str) -> BTreeMap<&'static str, String> {
         }
         "github_workspace_settings" => {
             add_code(&mut responses, "404", "github_workspace_not_found");
+        }
+        "save_github_workspace_settings" => {
+            add_code(&mut responses, "403", "github_manager_required");
+            add_code(&mut responses, "404", "github_workspace_not_found");
+            add_code(&mut responses, "422", "invalid_github_settings");
+            add_code(&mut responses, "503", "github_polling_unavailable");
+        }
+        "github_sync_status" | "github_sync_now" => {
+            add_code(&mut responses, "403", "github_manager_required");
+            add_code(&mut responses, "404", "github_workspace_not_found");
+            if operation_id == "github_sync_now" {
+                add_code(&mut responses, "409", "github_polling_not_enabled");
+            }
         }
         "github_project_settings" => add_code(&mut responses, "404", "github_project_not_found"),
         "save_github_project_connection" | "delete_github_project_connection" => {

@@ -43,3 +43,15 @@ A labeled pull request creates its own Orbit task, with its GitHub title, body, 
 If you delete a linked task in Orbit, the next GitHub event with the project label restores that same task and applies the current GitHub title, body, and status. An event without the label keeps the task deleted and pauses sync.
 
 GitHub App registration uses the [GitHub App manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest). GitHub sends signed events as described in its [webhook validation guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries). App installation is described in [GitHub's installation guide](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app).
+
+## Workspace polling mode
+
+The setup above describes the default webhook integration. A workspace-level polling mode is available for Orbit instances that are accessible to users over private HTTPS but cannot receive inbound GitHub webhooks. The browser must be able to reach Orbit over HTTPS for registration and the callback.
+
+In polling mode, the App manifest leaves webhooks inactive. Orbit discovers App installations and repository access through outbound GitHub API requests rather than installation events. Workspace owners and admins can choose a polling interval from 1 to 15 minutes, with a default of 5 minutes. Shorter intervals reduce synchronization latency but consume more GitHub API quota; longer intervals conserve quota but delay updates.
+
+Polling remains one-way: Orbit does not write task changes back to GitHub. A successful, complete poll can pause sync for an item whose project label was removed, retaining its task so adding the label again can resume it. Failed or incomplete polls must not be treated as proof that a label was removed.
+
+**Sync now** requests an immediate poll for the whole workspace, bypassing Orbit's own polling backoff. It will not reset or bypass GitHub's rate limits or their reset times.
+
+If switching an existing workspace between webhooks and polling, Orbit fences writes and transitions durably. Switching from polling back to webhooks performs a complete final poll before activating webhook handling, while incoming deliveries during the handoff return 503 so GitHub safely retries them.

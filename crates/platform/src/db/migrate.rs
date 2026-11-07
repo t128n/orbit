@@ -526,6 +526,11 @@ impl MigrationRunner {
                     include_str!("../../../../apps/server/migrations/0078_github_host.sql"),
                     false,
                 ),
+                Migration::new(
+                    79,
+                    include_str!("../../../../apps/server/migrations/0079_github_polling.sql"),
+                    false,
+                ),
             ],
         );
         runner.postgres = vec![
@@ -720,6 +725,11 @@ impl MigrationRunner {
             Migration::new(
                 78,
                 include_str!("../../../../apps/server/migrations/postgres/0078_github_host.sql"),
+                false,
+            ),
+            Migration::new(
+                79,
+                include_str!("../../../../apps/server/migrations/postgres/0079_github_polling.sql"),
                 false,
             ),
         ];
