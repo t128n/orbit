@@ -18,19 +18,25 @@ use crate::{
 
 /// Dispatch due work from a durable recurring job. Claims are independently fenced,
 /// so retries, multiple servers and overlapping jobs cannot apply the same generation.
-pub(crate) async fn dispatch(database: Database, key: Option<[u8; 32]>) -> Result<(), sqlx::Error> {
+pub(crate) async fn dispatch(
+    database: Database,
+    key: Option<[u8; 32]>,
+    github_host: orbit_platform::GitHubHost,
+) -> Result<(), sqlx::Error> {
     const MAX_CONCURRENT_WORKSPACES: usize = 4;
     const LEASE_MS: i64 = 120_000;
 
     let workspaces: Vec<String> = sqlx::query_scalar(
         "SELECT c.workspace_id FROM github_workspace_settings c LEFT JOIN github_poll_state s ON s.workspace_id = c.workspace_id WHERE c.sync_mode = 'polling' ORDER BY CASE WHEN s.last_started_at IS NULL THEN 0 ELSE 1 END, s.last_started_at, c.workspace_id",
     ).fetch_all(database.pool()).await?;
-    let tasks = Arc::new(TaskRepository::new(database.clone()));
+    let rest_base = Arc::new(github_host.rest_base());
+    let tasks = Arc::new(TaskRepository::new(database.clone()).with_github_host(github_host));
     // The futures are owned by the dispatch job, not detached tasks. Dropping the job
     // cancels them, stops lease renewal, and lets unfinished claims expire safely.
     let mut workers = stream::iter(workspaces.into_iter().map(|workspace| {
         let database = database.clone();
         let tasks = tasks.clone();
+        let rest_base = Arc::clone(&rest_base);
         async move {
             let owner = Id::new_v7().to_string();
             let Some(claim) = schedule::try_claim(&database, &workspace, &owner, LEASE_MS).await?
@@ -41,7 +47,7 @@ pub(crate) async fn dispatch(database: Database, key: Option<[u8; 32]>) -> Resul
                 tasks,
                 &claim,
                 key.as_ref(),
-                "https://api.github.com/",
+                &rest_base,
                 LEASE_MS,
             )
             .await

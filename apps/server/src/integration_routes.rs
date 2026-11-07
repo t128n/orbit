@@ -244,6 +244,7 @@ pub(crate) async fn github_sync_status(
     let id = request_id.as_ref().map(|Extension(id)| id);
     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
     require_github_manager(can_manage, id)?;
+    check_github_binding(&state, id).await?;
     let row = sqlx::query("SELECT c.sync_mode, t.target_mode, s.last_started_at, s.last_finished_at, s.next_poll_at, s.rate_limit_not_before, s.backoff_until, s.consecutive_failures, s.last_status, s.last_result, s.last_items_seen, s.last_items_updated FROM github_workspace_settings c LEFT JOIN github_poll_state s ON s.workspace_id = c.workspace_id LEFT JOIN github_poll_transition t ON t.workspace_id = c.workspace_id WHERE c.workspace_id = $1")
         .bind(&workspace).fetch_optional(state.tasks.database().pool()).await.map_err(|_| ApiError::internal(id))?;
     Ok(Json(GithubSyncStatus {
@@ -276,6 +277,7 @@ pub(crate) async fn github_sync_now(
     let id = request_id.as_ref().map(|Extension(id)| id);
     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
     require_github_manager(can_manage, id)?;
+    check_github_binding(&state, id).await?;
     if !crate::github_poll_schedule::sync_now(state.tasks.database(), &workspace)
         .await
         .map_err(|_| ApiError::internal(id))?
@@ -512,6 +514,7 @@ pub(crate) async fn save_github_workspace_settings(
     let id = request_id.as_ref().map(|Extension(id)| id);
     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
     require_github_manager(can_manage, id)?;
+    check_github_binding(&state, id).await?;
     if !matches!(body.sync_mode.as_str(), "webhooks" | "polling")
         || !(1..=15).contains(&body.poll_interval_minutes)
     {
@@ -2049,6 +2052,9 @@ mod tests {
                 },
                 now,
             )
+            .await
+            .unwrap();
+        crate::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
             .await
             .unwrap();
         let state = IntegrationState::new(

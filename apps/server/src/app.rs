@@ -362,6 +362,7 @@ impl App {
             workspace_exports.clone(),
             billing.clone(),
             app_key,
+            config.github.clone(),
             config.jobs.concurrency,
         )
         .await?;
@@ -1010,6 +1011,7 @@ async fn initialize_production_services(
     workspace_exports: WorkspaceExportService,
     billing: Option<crate::billing::Billing>,
     app_key: Option<[u8; 32]>,
+    github_host: orbit_platform::GitHubHost,
     concurrency: usize,
 ) -> Result<ProductionServices, AppError> {
     let store = JobStore::new(database.clone());
@@ -1107,10 +1109,12 @@ async fn initialize_production_services(
         })
         .and_then(|worker| {
             let database = database.clone();
+            let github_host = github_host.clone();
             worker.with_handler(maintenance_kind(GITHUB_POLL), move |_| {
                 let database = database.clone();
+                let github_host = github_host.clone();
                 async move {
-                    crate::github_poll::worker::dispatch(database, app_key).await
+                    crate::github_poll::worker::dispatch(database, app_key, github_host).await
                         .map_err(|_| JobError::Retryable("GitHub polling dispatch failed".to_owned()))
                 }
             })
