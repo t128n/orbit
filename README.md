@@ -25,10 +25,12 @@ workspace without your data leaving your server.
 
 One binary. A Rust server serves the API and the embedded React app. Data is in
 SQLite (default) or Postgres, files on local disk or S3. Put a reverse proxy in
-front for HTTPS. Docker image: `ghcr.io/coollabsio/orbit:latest`. Linux and
-Windows binaries (`orbit.exe` installs as a native Windows Service) are on the
-[releases page](https://github.com/coollabsio/orbit/releases); see
-[Windows Server (bare metal)](docs/operations.md#windows-server-bare-metal).
+front for HTTPS. This fork ([t128n/orbit-windows](https://github.com/t128n/orbit-windows))
+adds native Windows Server support: `orbit.exe` installs as a Windows Service, and
+the [releases page](https://github.com/t128n/orbit-windows/releases) carries a
+Windows binary. See [Windows Server (bare metal)](docs/operations.md#windows-server-bare-metal).
+For the Docker image and Linux binaries, see upstream:
+[coollabsio/orbit](https://github.com/coollabsio/orbit).
 
 ## Development
 

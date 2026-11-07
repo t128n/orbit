@@ -1,9 +1,9 @@
-name: Container image
+name: Windows binary
 
 on:
   push:
     branches: [main]
-  # A published GitHub release also publishes the image as `<version>`, `<major>.<minor>` and `latest`.
+  # A published GitHub release also gets the Windows binary attached.
   release:
     types: [published]
 
@@ -36,100 +36,8 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  image:
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - architecture: amd64
-            runner: ubuntu-24.04
-            uname: x86_64
-          - architecture: arm64
-            runner: ubuntu-24.04-arm
-            uname: aarch64
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Verify native build host
-        env:
-          EXPECTED_UNAME: ${{ matrix.uname }}
-        run: |
-          test "$(uname -m)" = "$EXPECTED_UNAME"
-          test "$(docker info --format '{{.Architecture}}')" = "$EXPECTED_UNAME"
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - name: Set image name
-        id: image
-        env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}-${ARCHITECTURE}"
-          echo "name=$image" >> "$GITHUB_OUTPUT"
-      - name: Build native image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          build-args: ORBIT_BUILD_REVISION=${{ github.sha }}
-          labels: |
-            org.opencontainers.image.version=${{ needs.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          tags: ${{ steps.image.outputs.name }}
-          load: true
-          cache-from: type=gha,scope=orbit-${{ matrix.architecture }}
-          cache-to: type=gha,mode=max,scope=orbit-${{ matrix.architecture }}
-      - name: Verify and smoke-test native image
-        env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}-${ARCHITECTURE}"
-          test "$(docker image inspect "$image" --format '{{.Architecture}}')" = "$ARCHITECTURE"
-          docker run --rm "$image" --help
-          bash deploy/smoke.sh "$image"
-      - name: Publish architecture image
-        env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}-${ARCHITECTURE}"
-          docker push "$image"
-      # A release also gets the smoke-tested executable, so people can run Orbit without Docker.
-      - name: Extract release binary
-        if: github.event_name == 'release'
-        env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-          UNAME: ${{ matrix.uname }}
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}-${ARCHITECTURE}"
-          binary="orbit-linux-$UNAME"
-          container=$(docker create "$image")
-          docker cp "$container:/orbit" "$binary"
-          docker rm -v "$container"
-          file "$binary" | tee file.txt
-          grep -E 'static(-pie|ally) linked' file.txt
-          grep ', stripped' file.txt
-          "./$binary" --help > /dev/null
-          mkdir package
-          mv "$binary" package/orbit
-          XZ_OPT=-9 tar -C package -cJf "$binary.tar.xz" orbit
-      - name: Keep release binary for the release job
-        if: github.event_name == 'release'
-        uses: actions/upload-artifact@v7
-        with:
-          name: orbit-linux-${{ matrix.uname }}
-          path: orbit-linux-${{ matrix.uname }}.tar.xz
-          if-no-files-found: error
-          retention-days: 1
-
-  # Bare-metal Windows deployment gets a native binary too: no Docker, no musl, no cargo-chef
-  # layer cache. The web frontend and the Rust workspace both build natively on windows-latest.
+  # Bare-metal Windows deployment: no Docker, no musl. The web frontend and the Rust workspace
+  # both build natively on windows-latest.
   windows-binary:
     needs: version
     runs-on: windows-latest
@@ -165,74 +73,21 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  release-binaries:
+  release:
     if: github.event_name == 'release'
-    needs: [version, image, windows-binary]
+    needs: [version, windows-binary]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: orbit-linux-*
-          merge-multiple: true
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: orbit-windows-*
-          merge-multiple: true
-      - name: Attach binaries and checksums to the release
+          name: orbit-windows-x86_64
+      - name: Attach the binary and checksum to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          files=(orbit-linux-x86_64.tar.xz orbit-linux-aarch64.tar.xz orbit-windows-x86_64.zip)
-          sha256sum "${files[@]}" | tee SHA256SUMS
+          sha256sum orbit-windows-x86_64.zip | tee SHA256SUMS
           # --clobber replaces the files when the workflow runs again for the same release.
-          gh release upload "$TAG" "${files[@]}" SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
-
-  publish:
-    needs: [version, image]
-    runs-on: ubuntu-24.04
-    permissions:
-      packages: write
-    steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - name: Publish multi-platform manifest
-        env:
-          EVENT: ${{ github.event_name }}
-          PRERELEASE: ${{ github.event.release.prerelease }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          tag=${GITHUB_SHA::7}
-          if [ "$EVENT" = release ]; then
-            tags=(--tag "$image:$VERSION")
-            # a pre-release (for example 0.2.0-rc.1) gets only its exact tag
-            if [ "$PRERELEASE" != true ]; then
-              tags+=(--tag "$image:${VERSION%.*}" --tag "$image:latest")
-            fi
-          else
-            tags=(--tag "$image:$tag" --tag "$image:main")
-          fi
-          docker buildx imagetools create "${tags[@]}" \
-            "$image:$tag-amd64" \
-            "$image:$tag-arm64"
-          docker buildx imagetools inspect "$image:$tag" | tee manifest.txt
-          grep -E 'Platform:[[:space:]]+linux/amd64' manifest.txt
-          grep -E 'Platform:[[:space:]]+linux/arm64' manifest.txt
-      - name: Deploy to Coolify Cloud
-        if: github.event_name == 'push'
-        env:
-          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
-          COOLIFY_WEBHOOK: ${{ secrets.COOLIFY_WEBHOOK }}
-        run: |
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $COOLIFY_TOKEN" \
-            "$COOLIFY_WEBHOOK"
+          gh release upload "$TAG" orbit-windows-x86_64.zip SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
