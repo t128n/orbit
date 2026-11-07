@@ -2435,6 +2435,7 @@ dependencies = [
  "rand_core 0.6.4",
  "reqwest",
  "rmcp",
+ "rsa",
  "schemars 1.2.2",
  "serde",
  "serde_json",

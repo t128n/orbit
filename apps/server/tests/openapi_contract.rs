@@ -42,7 +42,7 @@ fn openapi_generation_is_byte_stable_and_covers_public_routes() {
                 .count()
         })
         .sum();
-    assert_eq!(operation_count, 317);
+    assert_eq!(operation_count, 318);
     for path in [
         "/api/v1/setup/status",
         "/api/v1/auth/me",

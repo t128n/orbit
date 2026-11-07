@@ -63,6 +63,36 @@ test('workspace settings show an empty state before repositories are installed',
   expect(await view.findByText('No repositories installed yet.')).toBeTruthy()
 })
 
+test('managers can save polling settings and run a sync', async () => {
+  const requests: { method: string; path: string; body?: unknown }[] = []
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const request = input as Request
+    const path = new URL(request.url).pathname
+    requests.push({ method: request.method, path, ...(request.method === 'PUT' ? { body: await request.json() } : {}) })
+    if (request.method === 'POST') return Response.json({ synced: 3 })
+    return Response.json({ app_slug: null, install_url: null, repositories: [], can_manage: true, key_configured: true, sync_mode: 'webhooks', poll_interval_minutes: 5 })
+  }) as typeof fetch
+  const view = renderPage()
+  await view.findByRole('radio', { name: 'Polling' })
+  await userEvent.click(view.getByRole('radio', { name: 'Polling' }))
+  const interval = view.getByLabelText('Polling interval (1–15 minutes)')
+  await userEvent.clear(interval)
+  await userEvent.type(interval, '15')
+  await userEvent.click(view.getByRole('button', { name: 'Save sync settings' }))
+  await waitFor(() => expect(requests.some((r) => r.method === 'PUT' && JSON.stringify(r.body) === JSON.stringify({ sync_mode: 'polling', poll_interval_minutes: 15 }))).toBe(true))
+  await userEvent.click(view.getByRole('button', { name: 'Sync now' }))
+  await view.findByText(/"synced":3/)
+  expect(requests.some((r) => r.method === 'POST' && r.path === '/api/v1/workspaces/workspace-1/github/sync')).toBe(true)
+})
+
+test('members cannot change sync settings or run a sync', async () => {
+  globalThis.fetch = (async () => Response.json({ app_slug: null, repositories: [], can_manage: false, key_configured: true, sync_mode: 'polling', poll_interval_minutes: 5 })) as unknown as typeof fetch
+  const view = renderPage()
+  const polling = await view.findByRole('radio', { name: 'Polling' })
+  expect((polling as HTMLInputElement).disabled || polling.closest('fieldset')?.disabled).toBe(true)
+  expect(view.queryByRole('button', { name: 'Sync now' })).toBeNull()
+})
+
 test('registration can be started again after browser Back restores the page', async () => {
   const submitted: string[] = []
   let requests = 0

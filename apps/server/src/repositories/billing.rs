@@ -108,6 +108,20 @@ pub async fn write_access(
     workspace_access(database, workspace_id, &billing.0).await
 }
 
+/// Check access within the same serialized transaction as a background write.
+pub(crate) async fn write_access_in(
+    database: &Database,
+    transaction: &mut Transaction<'_, Any>,
+    workspace_id: Id,
+) -> Result<WorkspaceAccess, sqlx::Error> {
+    let Some(billing) = database.existing_extension::<BillingOn>() else {
+        return Ok(WorkspaceAccess::Full);
+    };
+    Ok(subscription_in(&mut **transaction, workspace_id)
+        .await?
+        .access(TimestampMillis::now(), &billing.0))
+}
+
 /// Workspaces by trial state, for the Admin area. Deleted workspaces are not counted.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct TrialCounts {

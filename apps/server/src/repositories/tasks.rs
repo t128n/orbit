@@ -297,6 +297,79 @@ pub struct GithubWorkItem {
     pub state_changed: bool,
 }
 
+/// Lease identity captured when a polling run was claimed.
+#[derive(Clone, Debug)]
+pub struct PollFence {
+    pub workspace_id: String,
+    pub owner: String,
+    pub generation: i64,
+    pub config_version: i64,
+    pub mode_epoch: i64,
+}
+
+impl From<&crate::github_poll_schedule::Claim> for PollFence {
+    fn from(claim: &crate::github_poll_schedule::Claim) -> Self {
+        Self {
+            workspace_id: claim.workspace_id.clone(),
+            owner: claim.owner.clone(),
+            generation: claim.generation,
+            config_version: claim.config_version,
+            mode_epoch: claim.mode_epoch,
+        }
+    }
+}
+
+/// Must be checked in an immediate transaction, which serializes all Orbit writers.
+pub(crate) async fn webhook_epoch_current(
+    tx: &mut Transaction<'_, Any>,
+    workspace: &str,
+    epoch: i64,
+) -> Result<bool, sqlx::Error> {
+    let current: Option<(String, i64)> = sqlx::query_as(
+        "SELECT sync_mode, mode_epoch FROM github_workspace_settings WHERE workspace_id = $1",
+    )
+    .bind(workspace)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(match current {
+        Some((mode, current)) => mode == "webhooks" && current == epoch,
+        None => epoch == 1,
+    })
+}
+
+/// Check using database time while holding the same immediate transaction as the effect.
+pub(crate) async fn poll_fence_current(
+    tx: &mut Transaction<'_, Any>,
+    database: &Database,
+    workspace: &str,
+    fence: &PollFence,
+) -> Result<bool, sqlx::Error> {
+    if workspace != fence.workspace_id {
+        return Ok(false);
+    }
+    let workspace_id: Id = workspace
+        .parse()
+        .map_err(|_| sqlx::Error::Protocol("invalid polling workspace".into()))?;
+    if super::billing::write_access_in(database, tx, workspace_id).await?
+        == crate::billing::WorkspaceAccess::ReadOnly
+    {
+        return Ok(false);
+    }
+    let sql = match database.backend() {
+        Backend::Sqlite => "SELECT COUNT(*) FROM github_poll_state s JOIN github_workspace_settings c ON c.workspace_id = s.workspace_id WHERE s.workspace_id = $1 AND s.generation = $2 AND s.lease_owner = $3 AND s.config_version = $4 AND c.config_version = $4 AND c.mode_epoch = $5 AND c.sync_mode = 'polling' AND s.lease_expires_at > (CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))",
+        Backend::Postgres => "SELECT COUNT(*) FROM github_poll_state s JOIN github_workspace_settings c ON c.workspace_id = s.workspace_id WHERE s.workspace_id = $1 AND s.generation = $2 AND s.lease_owner = $3 AND s.config_version = $4 AND c.config_version = $4 AND c.mode_epoch = $5 AND c.sync_mode = 'polling' AND s.lease_expires_at > CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)",
+    };
+    let count: i64 = sqlx::query_scalar(sql)
+        .bind(workspace)
+        .bind(fence.generation)
+        .bind(&fence.owner)
+        .bind(fence.config_version)
+        .bind(fence.mode_epoch)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(count == 1)
+}
+
 /// What a comment says: BlockNote blocks (mentions are read from them), or markdown with the
 /// members the client mentions.
 #[derive(Clone, Debug)]
@@ -1873,29 +1946,137 @@ impl TaskRepository {
         crate::github_binding::check(&self.database, &self.github_host)
             .await
             .map_err(github_binding_error)?;
-        // A linked task's live description is replaced with the issue body in the transaction
-        // below; its room is locked first.
-        let linked: Option<String> = sqlx::query_scalar(
-            "SELECT task_id FROM github_issue_links WHERE workspace_id = $1 AND repository = $2 AND issue_number = $3",
+        self.apply_github_work_item(
+            workspace_id,
+            actor_id,
+            issue,
+            request_id,
+            now,
+            false,
+            None,
+            None,
         )
-        .bind(workspace_id.to_string())
-        .bind(&issue.repository)
-        .bind(issue.number)
-        .fetch_optional(self.database.pool())
-        .await?;
-        let mut collab = match linked.map(parse_id).transpose()? {
-            Some(task_id) => Some((
-                task_id,
-                CollabHub::of(&self.database)
-                    .write(DocKey::task(task_id))
-                    .await?,
-            )),
-            None => None,
+        .await?
+        .ok_or(TaskError::Conflict)
+    }
+
+    pub(crate) async fn sync_github_webhook(
+        &self,
+        workspace_id: Id,
+        actor_id: Id,
+        issue: GithubWorkItem,
+        request_id: &str,
+        now: TimestampMillis,
+        epoch: i64,
+    ) -> Result<Option<Id>, TaskError> {
+        self.apply_github_work_item(
+            workspace_id,
+            actor_id,
+            issue,
+            request_id,
+            now,
+            false,
+            None,
+            Some(epoch),
+        )
+        .await
+    }
+
+    /// Apply a polling observation. A status transition is made only when the observed GitHub
+    /// state differs from the last recorded state, preserving manual Orbit status changes.
+    pub async fn observe_github_work_item(
+        &self,
+        workspace_id: Id,
+        actor_id: Id,
+        issue: GithubWorkItem,
+        request_id: &str,
+        now: TimestampMillis,
+        fence: &PollFence,
+    ) -> Result<Option<Id>, TaskError> {
+        self.apply_github_work_item(
+            workspace_id,
+            actor_id,
+            issue,
+            request_id,
+            now,
+            true,
+            Some(fence),
+            None,
+        )
+        .await
+    }
+
+    async fn apply_github_work_item(
+        &self,
+        workspace_id: Id,
+        actor_id: Id,
+        issue: GithubWorkItem,
+        request_id: &str,
+        now: TimestampMillis,
+        compare_observed_state: bool,
+        fence: Option<&PollFence>,
+        webhook_epoch: Option<i64>,
+    ) -> Result<Option<Id>, TaskError> {
+        // Lock the room before the transaction, then verify the link under the writer lock.
+        // Another writer may have created or changed it while we were acquiring the room.
+        let mut attempts = 0;
+        let (mut collab, mut tx) = loop {
+            let linked: Option<String> = sqlx::query_scalar(
+                "SELECT task_id FROM github_issue_links WHERE workspace_id = $1 AND repository = $2 AND issue_number = $3",
+            )
+            .bind(workspace_id.to_string())
+            .bind(&issue.repository)
+            .bind(issue.number)
+            .fetch_optional(self.database.pool())
+            .await?;
+            let linked = linked.map(parse_id).transpose()?;
+            let collab = match linked {
+                Some(task_id) => Some((
+                    task_id,
+                    CollabHub::of(&self.database)
+                        .write(DocKey::task(task_id))
+                        .await?,
+                )),
+                None => None,
+            };
+            let mut tx = self.database.immediate_transaction().await?;
+            let current: Option<String> = sqlx::query_scalar(
+                "SELECT task_id FROM github_issue_links WHERE workspace_id = $1 AND repository = $2 AND issue_number = $3",
+            )
+            .bind(workspace_id.to_string())
+            .bind(&issue.repository)
+            .bind(issue.number)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if current.map(parse_id).transpose()? == linked {
+                break (collab, tx);
+            }
+            tx.rollback().await?;
+            drop(collab);
+            attempts += 1;
+            if attempts == 8 {
+                return Err(TaskError::Busy);
+            }
         };
-        let mut tx = self.database.immediate_transaction().await?;
         crate::github_binding::check_in_transaction(&mut tx, &self.github_host)
             .await
             .map_err(github_binding_error)?;
+        if let Some(epoch) = webhook_epoch
+            && !webhook_epoch_current(&mut tx, &workspace_id.to_string(), epoch).await?
+        {
+            return Ok(None);
+        }
+        if let Some(fence) = fence
+            && !poll_fence_current(
+                &mut tx,
+                &self.database,
+                &workspace_id.to_string(),
+                fence,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         require_access_tx(&mut tx, workspace_id, actor_id).await?;
         let (service_account_id, service_account_name) =
             github_service_account_in_tx(&mut tx, workspace_id, actor_id, now).await?;
@@ -1924,7 +2105,7 @@ impl TaskRepository {
             _ => "unstarted",
         };
         let existing = sqlx::query(
-            "SELECT github_issue_links.task_id, github_issue_links.kind, tasks.project_id, tasks.status_id, tasks.deleted_at, tasks.source_url FROM github_issue_links JOIN tasks ON tasks.id = github_issue_links.task_id WHERE github_issue_links.workspace_id = $1 AND repository = $2 AND issue_number = $3",
+            "SELECT github_issue_links.task_id, github_issue_links.kind, github_issue_links.pull_state, tasks.project_id, tasks.status_id, tasks.deleted_at, tasks.source_url FROM github_issue_links JOIN tasks ON tasks.id = github_issue_links.task_id WHERE github_issue_links.workspace_id = $1 AND repository = $2 AND issue_number = $3",
         ).bind(workspace_id.to_string()).bind(&issue.repository).bind(issue.number).fetch_optional(&mut *tx).await?;
         if let Some(row) = &existing {
             let issue_url = row
@@ -1942,7 +2123,12 @@ impl TaskRepository {
                 return Err(TaskError::IntegrationConflict);
             }
             let current_status_id: String = row.get("status_id");
-            let status_id: String = if issue.state_changed || was_deleted {
+            let state_changed = if compare_observed_state {
+                row.get::<String, _>("pull_state") != issue.state
+            } else {
+                issue.state_changed
+            };
+            let status_id: String = if state_changed || was_deleted {
                 sqlx::query_scalar(
                         "SELECT id FROM task_statuses WHERE workspace_id = $1 AND project_id = $2 AND category = $3 ORDER BY position, id LIMIT 1",
                     ).bind(workspace_id.to_string()).bind(row.get::<String, _>("project_id"))
@@ -1987,9 +2173,11 @@ impl TaskRepository {
                     .bind(task_id.to_string())
                     .execute(&mut *tx)
                     .await?;
-                if let Some((_, collab)) = collab.as_mut().filter(|(id, _)| *id == task_id) {
-                    collab.replace(&mut tx, &blocks, actor_id, now).await?;
-                }
+                let (_, collab) = collab
+                    .as_mut()
+                    .filter(|(id, _)| *id == task_id)
+                    .ok_or(TaskError::Busy)?;
+                collab.replace(&mut tx, &blocks, actor_id, now).await?;
             }
             let changed = sqlx::query(
                     "UPDATE tasks SET title = $1, description = $2, source_url = $3, status_id = $4, deleted_at = NULL, version = version + 1, updated_at = $5 WHERE id = $6 AND workspace_id = $7 AND (deleted_at IS NOT NULL OR title != $8 OR description != $9 OR source_url IS DISTINCT FROM $10 OR status_id != $11)",
@@ -2098,11 +2286,22 @@ impl TaskRepository {
                 )
                 .await?;
             }
+            if let Some(fence) = fence
+                && !poll_fence_current(
+                    &mut tx,
+                    &self.database,
+                    &workspace_id.to_string(),
+                    fence,
+                )
+                .await?
+            {
+                return Ok(None);
+            }
             tx.commit().await?;
             if let Some((_, collab)) = collab {
                 collab.commit();
             }
-            return Ok(task_id);
+            return Ok(Some(task_id));
         }
         ensure_trial_capacity(&self.database, &mut tx, workspace_id, TrialLimit::Tasks, 1).await?;
         let status_id: String = sqlx::query_scalar(
@@ -2152,8 +2351,19 @@ impl TaskRepository {
             now,
         )
         .await?;
+        if let Some(fence) = fence
+            && !poll_fence_current(
+                &mut tx,
+                &self.database,
+                &workspace_id.to_string(),
+                fence,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         tx.commit().await?;
-        Ok(task_id)
+        Ok(Some(task_id))
     }
 
     pub async fn create_discord_task(

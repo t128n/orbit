@@ -6,6 +6,7 @@ import { Platform, View } from 'react-native'
 
 import { SettingsCard, SettingsShell, WORKSPACE_NAV } from '../../../components/settings/Shell'
 import { githubManifest } from '../../../data/workspace-settings-api'
+import { saveGithubSyncSettings, syncGithubNow, type SyncMode } from '../../../data/github-sync-api'
 import { useGithubSettings } from '../../../hooks/workspace-settings'
 import { useOrbit } from '../../../orbit-context'
 import { errorMessage } from '../../../session-context'
@@ -63,6 +64,7 @@ function Github({ settings, refetch }: { settings: GithubWorkspaceSettings; refe
 
   return (
     <SettingsCard title="GitHub" description="Manage the GitHub App for this workspace. Connect repositories to projects in each project's settings.">
+      <SyncControls key={`${workspaceId}:${(settings as { sync_mode?: string }).sync_mode}:${(settings as { poll_interval_minutes?: number }).poll_interval_minutes}`} settings={settings} refetch={refetch} />
       {!settings.app_slug ? (
         <View className="items-start gap-2">
           <Body muted>Register a GitHub App from Orbit. GitHub will return you to this workspace.</Body>
@@ -106,6 +108,35 @@ function Github({ settings, refetch }: { settings: GithubWorkspaceSettings; refe
       )}
     </SettingsCard>
   )
+}
+
+function SyncControls({ settings, refetch }: { settings: GithubWorkspaceSettings; refetch: () => Promise<unknown> }) {
+  const { client, workspaceId } = useOrbit()
+  const current = settings as GithubWorkspaceSettings & { sync_mode?: SyncMode; poll_interval_minutes?: number }
+  const [mode, setMode] = useState<SyncMode>(current.sync_mode ?? 'webhooks')
+  const [interval, setInterval] = useState(String(current.poll_interval_minutes ?? 5))
+  const valid = /^\d+$/.test(interval) && Number(interval) >= 1 && Number(interval) <= 15
+  const save = useMutation({ mutationFn: () => saveGithubSyncSettings(client, workspaceId, { sync_mode: mode, poll_interval_minutes: Number(interval) }), onSuccess: () => refetch() })
+  const sync = useMutation({ mutationFn: () => syncGithubNow(client, workspaceId), onSuccess: () => refetch() })
+  const available = current.sync_mode === 'webhooks' || current.sync_mode === 'polling'
+  return <View accessibilityLabel="GitHub sync" className="mb-6 gap-3">
+    <Text className="font-noto-medium text-[14px] leading-[20px]">GitHub sync</Text>
+    {!available ? <Body muted>Sync settings are not available from this server.</Body> : <>
+      <Text className="font-noto-medium text-[14px] leading-[20px]">Sync mode</Text>
+      <View className="flex-row flex-wrap gap-2">
+        <Button label={mode === 'webhooks' ? 'Webhooks (selected)' : 'Webhooks'} variant={mode === 'webhooks' ? 'primary' : 'outline'} disabled={!settings.can_manage || save.isPending} onPress={() => setMode('webhooks')} />
+        <Button label={mode === 'polling' ? 'Polling (selected)' : 'Polling'} variant={mode === 'polling' ? 'primary' : 'outline'} disabled={!settings.can_manage || save.isPending} onPress={() => setMode('polling')} />
+      </View>
+      <Input label="Polling interval (1–15 minutes)" keyboardType="number-pad" value={interval} onChangeText={setInterval} editable={settings.can_manage && !save.isPending} />
+      {!valid ? <Text className="text-[12px] leading-[16px] text-destructive">Enter a whole number from 1 to 15.</Text> : null}
+      {settings.can_manage ? <View className="flex-row flex-wrap gap-2"><Button label="Save sync settings" disabled={!valid || save.isPending} onPress={() => save.mutate()} /><Button label="Sync now" variant="outline" disabled={sync.isPending} onPress={() => sync.mutate()} /></View> : <Body muted>Only workspace owners and admins can change settings or sync now.</Body>}
+      {save.isSuccess ? <Body>Sync settings saved.</Body> : null}
+      {save.isError ? <Text className="text-[12px] leading-[16px] text-destructive">{errorMessage(save.error) || 'Could not save sync settings.'}</Text> : null}
+      {sync.isError ? <Text className="text-[12px] leading-[16px] text-destructive">{errorMessage(sync.error) || 'Sync could not start.'}</Text> : null}
+      {sync.isSuccess ? <Body>Sync request completed.{sync.data == null ? '' : ` Result: ${JSON.stringify(sync.data)}`}</Body> : null}
+    </>}
+    <Body muted>Sync status and backoff are not available from this server.</Body>
+  </View>
 }
 
 /** The web card body's `text-sm`. */

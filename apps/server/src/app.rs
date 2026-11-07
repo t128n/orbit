@@ -73,6 +73,7 @@ const OWNERSHIP_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const NOTION_CLEANUP: &str = "notion.cleanup";
 /// Hourly: creates a backup when the saved schedule (Admin → Storage) says one is due.
 const SCHEDULED_BACKUP: &str = "backup.scheduled";
+const GITHUB_POLL: &str = "github.poll";
 
 pub struct App {
     config: Config,
@@ -360,6 +361,7 @@ impl App {
             obsidian_imports.clone(),
             workspace_exports.clone(),
             billing.clone(),
+            app_key,
             config.jobs.concurrency,
         )
         .await?;
@@ -1007,6 +1009,7 @@ async fn initialize_production_services(
     obsidian_imports: ObsidianImportService,
     workspace_exports: WorkspaceExportService,
     billing: Option<crate::billing::Billing>,
+    app_key: Option<[u8; 32]>,
     concurrency: usize,
 ) -> Result<ProductionServices, AppError> {
     let store = JobStore::new(database.clone());
@@ -1104,6 +1107,16 @@ async fn initialize_production_services(
         })
         .and_then(|worker| {
             let database = database.clone();
+            worker.with_handler(maintenance_kind(GITHUB_POLL), move |_| {
+                let database = database.clone();
+                async move {
+                    crate::github_poll::worker::dispatch(database, app_key).await
+                        .map_err(|_| JobError::Retryable("GitHub polling dispatch failed".to_owned()))
+                }
+            })
+        })
+        .and_then(|worker| {
+            let database = database.clone();
             worker.with_handler(maintenance_kind(SCHEDULED_BACKUP), move |_| {
                 let database = database.clone();
                 let backups = backups.clone();
@@ -1166,6 +1179,7 @@ async fn initialize_production_services(
         now,
     )
     .await?;
+    ensure_schedule(&scheduler, GITHUB_POLL, Duration::from_secs(60), now).await?;
     scheduler
         .validate_enabled()
         .await

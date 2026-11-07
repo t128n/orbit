@@ -28,7 +28,8 @@ use crate::repositories::billing;
 use crate::repositories::identity::IdentityRepository;
 use crate::repositories::membership;
 use crate::repositories::tasks::{
-    DiscordTask, GithubWorkItem, TaskError, TaskRecord, TaskRepository,
+    DiscordTask, GithubWorkItem, PollFence, TaskError, TaskRecord, TaskRepository,
+    poll_fence_current, webhook_epoch_current,
 };
 use crate::secret_box::{
     decrypt_secret as decrypt_github_secret, encrypt_secret as encrypt_github_secret,
@@ -168,7 +169,11 @@ pub fn integration_router(state: IntegrationState) -> Router {
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/github",
-            get(github_workspace_settings),
+            get(github_workspace_settings).put(save_github_workspace_settings),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/github/sync",
+            get(github_sync_status).post(github_sync_now),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/github/manifest",
@@ -201,6 +206,93 @@ pub struct GithubWorkspaceSettings {
     repositories: Vec<GithubRepositoryOption>,
     can_manage: bool,
     key_configured: bool,
+    sync_mode: String,
+    poll_interval_minutes: i64,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GithubWorkspaceSettingsBody {
+    sync_mode: String,
+    poll_interval_minutes: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GithubSyncStatus {
+    sync_mode: String,
+    transition_target: Option<String>,
+    sync_pending: bool,
+    last_started_at: Option<i64>,
+    last_finished_at: Option<i64>,
+    next_poll_at: Option<i64>,
+    rate_limit_not_before: Option<i64>,
+    backoff_until: Option<i64>,
+    consecutive_failures: i64,
+    last_status: Option<String>,
+    last_result: Option<String>,
+    last_items_seen: i64,
+    last_items_updated: i64,
+}
+
+#[utoipa::path(get, path = "/api/v1/workspaces/{workspace_id}/github/sync", params(("workspace_id" = String, Path)), responses((status = 200, body = GithubSyncStatus, description = "Active mode, pending handoff and polling status")))]
+pub(crate) async fn github_sync_status(
+    State(state): State<IntegrationState>,
+    Path(workspace): Path<String>,
+    headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
+) -> Result<Json<GithubSyncStatus>, ApiError> {
+    let id = request_id.as_ref().map(|Extension(id)| id);
+    let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
+    require_github_manager(can_manage, id)?;
+    let row = sqlx::query("SELECT c.sync_mode, t.target_mode, s.last_started_at, s.last_finished_at, s.next_poll_at, s.rate_limit_not_before, s.backoff_until, s.consecutive_failures, s.last_status, s.last_result, s.last_items_seen, s.last_items_updated FROM github_workspace_settings c LEFT JOIN github_poll_state s ON s.workspace_id = c.workspace_id LEFT JOIN github_poll_transition t ON t.workspace_id = c.workspace_id WHERE c.workspace_id = $1")
+        .bind(&workspace).fetch_optional(state.tasks.database().pool()).await.map_err(|_| ApiError::internal(id))?;
+    Ok(Json(GithubSyncStatus {
+        sync_mode: row.as_ref().map_or_else(|| "webhooks".to_owned(), |r| r.get("sync_mode")),
+        transition_target: row.as_ref().and_then(|r| r.get("target_mode")),
+        sync_pending: row.as_ref().and_then(|r| r.get::<Option<i64>, _>("next_poll_at")) == Some(-1),
+        last_started_at: row.as_ref().and_then(|r| r.get("last_started_at")),
+        last_finished_at: row.as_ref().and_then(|r| r.get("last_finished_at")),
+        next_poll_at: row
+            .as_ref()
+            .and_then(|r| r.get::<Option<i64>, _>("next_poll_at"))
+            .filter(|v| *v >= 0),
+        rate_limit_not_before: row.as_ref().and_then(|r| r.get("rate_limit_not_before")),
+        backoff_until: row.as_ref().and_then(|r| r.get("backoff_until")),
+        consecutive_failures: row.as_ref().and_then(|r| r.get::<Option<i64>, _>("consecutive_failures")).unwrap_or(0),
+        last_status: row.as_ref().and_then(|r| r.get("last_status")),
+        last_result: row.as_ref().and_then(|r| r.get("last_result")),
+        last_items_seen: row.as_ref().and_then(|r| r.get::<Option<i64>, _>("last_items_seen")).unwrap_or(0),
+        last_items_updated: row.as_ref().and_then(|r| r.get::<Option<i64>, _>("last_items_updated")).unwrap_or(0),
+    }))
+}
+
+fn polling_unavailable(id: Option<&RequestId>) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "github_polling_unavailable",
+        "GitHub polling unavailable",
+        "Polling is temporarily unavailable until webhook ordering is safe.",
+        id,
+    )
+}
+
+#[utoipa::path(post, path = "/api/v1/workspaces/{workspace_id}/github/sync", params(("workspace_id" = String, Path)), responses((status = 202, description = "Sync request queued; subject to polling cooldown and rate limits")))]
+pub(crate) async fn github_sync_now(
+    State(state): State<IntegrationState>,
+    Path(workspace): Path<String>,
+    headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
+) -> Result<StatusCode, ApiError> {
+    let id = request_id.as_ref().map(|Extension(id)| id);
+    let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
+    require_github_manager(can_manage, id)?;
+    if !crate::github_poll_schedule::sync_now(state.tasks.database(), &workspace)
+        .await
+        .map_err(|_| ApiError::internal(id))?
+    {
+        return Err(ApiError::new(StatusCode::CONFLICT, "github_polling_not_enabled", "GitHub polling not enabled", "Sync now is only available in polling mode.", id));
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -397,6 +489,8 @@ pub(crate) async fn github_workspace_settings(
             .fetch_optional(state.tasks.database().pool())
             .await
             .map_err(|_| ApiError::internal(id))?;
+    let settings = sqlx::query("SELECT sync_mode, poll_interval_minutes FROM github_workspace_settings WHERE workspace_id = $1")
+        .bind(&workspace).fetch_optional(state.tasks.database().pool()).await.map_err(|_| ApiError::internal(id))?;
     Ok(Json(GithubWorkspaceSettings {
         install_url: app
             .as_ref()
@@ -408,7 +502,62 @@ pub(crate) async fn github_workspace_settings(
             .github_settings
             .as_ref()
             .is_some_and(|settings| settings.encryption_key.is_some()),
+        sync_mode: settings
+            .as_ref()
+            .map_or_else(|| "webhooks".to_owned(), |row| row.get("sync_mode")),
+        poll_interval_minutes: settings
+            .as_ref()
+            .map_or(5, |row| row.get("poll_interval_minutes")),
     }))
+}
+
+#[utoipa::path(put, path = "/api/v1/workspaces/{workspace_id}/github", params(("workspace_id" = String, Path)), request_body = GithubWorkspaceSettingsBody, responses((status = 200, body = GithubWorkspaceSettings, description = "Current active settings; a return to webhooks waits for a successful final poll")))]
+pub(crate) async fn save_github_workspace_settings(
+    State(state): State<IntegrationState>,
+    Path(workspace): Path<String>,
+    headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
+    ApiJson(body): ApiJson<GithubWorkspaceSettingsBody>,
+) -> Result<Json<GithubWorkspaceSettings>, ApiError> {
+    let id = request_id.as_ref().map(|Extension(id)| id);
+    let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
+    require_github_manager(can_manage, id)?;
+    if !matches!(body.sync_mode.as_str(), "webhooks" | "polling")
+        || !(1..=15).contains(&body.poll_interval_minutes)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_github_settings",
+            "Invalid GitHub settings",
+            "Choose webhooks or polling and an interval from 1 to 15 minutes.",
+            id,
+        ));
+    }
+    // Poll snapshots can currently race webhook writes, including deliveries already in flight.
+    // A lease only fences other pollers; it does not establish ordering with webhooks.
+    if body.sync_mode == "polling" {
+        return Err(polling_unavailable(id));
+    }
+    request_github_settings_transition(state.tasks.database(), &workspace, &body)
+        .await
+        .map_err(|_| ApiError::internal(id))?;
+    github_workspace_settings(State(state), Path(workspace), headers, request_id).await
+}
+
+// Kept separate from the HTTP safety gate so handoff tests can exercise both directions
+// without exposing a way to enable polling in production.
+async fn request_github_settings_transition(
+    database: &orbit_platform::Database,
+    workspace: &str,
+    body: &GithubWorkspaceSettingsBody,
+) -> Result<(), sqlx::Error> {
+    crate::github_poll_transition::request(database, workspace, &body.sync_mode, body.poll_interval_minutes).await?;
+    let mut tx = database.immediate_transaction().await?;
+    // A return to webhooks retains its requested interval in the durable handoff;
+    // do not invalidate the final poll by changing the active polling configuration.
+    sqlx::query("UPDATE github_workspace_settings SET poll_interval_minutes = $1, config_version = config_version + 1 WHERE workspace_id = $2 AND sync_mode = $3 AND poll_interval_minutes != $1 AND NOT EXISTS (SELECT 1 FROM github_poll_transition WHERE workspace_id = $2)")
+        .bind(body.poll_interval_minutes).bind(workspace).bind(&body.sync_mode).execute(&mut *tx).await?;
+    tx.commit().await
 }
 
 #[utoipa::path(get, path = "/api/v1/workspaces/{workspace_id}/projects/{project_id}/github", params(("workspace_id" = String, Path), ("project_id" = String, Path)), responses((status = 200, body = GithubProjectSettings)))]
@@ -507,6 +656,7 @@ pub(crate) async fn save_github_project_connection(
         .bind(&workspace).bind(&project).bind(body.installation_id).bind(&body.repository).bind(label).execute(&mut *tx).await;
     match changed {
         Ok(result) if result.rows_affected() > 0 => {
+            invalidate_github_poll_config(&mut tx, &workspace, id).await?;
             record_github_change(&mut tx, &workspace, "github.connection.updated", id).await?;
         }
         Ok(_) => {}
@@ -559,10 +709,38 @@ pub(crate) async fn delete_github_project_connection(
     .await
     .map_err(|_| ApiError::internal(id))?;
     if removed.rows_affected() > 0 {
+        invalidate_github_poll_config(&mut tx, &workspace, id).await?;
         record_github_change(&mut tx, &workspace, "github.connection.deleted", id).await?;
     }
     tx.commit().await.map_err(|_| ApiError::internal(id))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// A poll may have loaded mappings before this edit. Invalidate its fence in the same
+// transaction as the mapping change, including for workspaces using default settings.
+async fn invalidate_github_poll_config(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    workspace: &str,
+    request_id: Option<&RequestId>,
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO github_workspace_settings (workspace_id) VALUES ($1) ON CONFLICT (workspace_id) DO UPDATE SET config_version = github_workspace_settings.config_version + 1")
+        .bind(workspace)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal(request_id))?;
+    // A handoff requested under the old mappings needs a fresh final poll under
+    // the new configuration, rather than becoming permanently unfinishable.
+    sqlx::query("UPDATE github_poll_transition SET config_version = (SELECT config_version FROM github_workspace_settings WHERE workspace_id = $1), minimum_generation = (SELECT generation + 1 FROM github_poll_state WHERE workspace_id = $1) WHERE workspace_id = $1")
+        .bind(workspace)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal(request_id))?;
+    sqlx::query("UPDATE github_poll_state SET next_poll_at = -1 WHERE workspace_id = $1 AND EXISTS (SELECT 1 FROM github_poll_transition WHERE workspace_id = $1)")
+        .bind(workspace)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal(request_id))?;
+    Ok(())
 }
 
 fn github_registration_origin(
@@ -651,6 +829,13 @@ pub(crate) async fn start_github_manifest(
             id,
         ));
     }
+    let sync_mode: Option<String> = sqlx::query_scalar(
+        "SELECT sync_mode FROM github_workspace_settings WHERE workspace_id = $1",
+    )
+    .bind(&workspace)
+    .fetch_optional(state.tasks.database().pool())
+    .await
+    .map_err(|_| ApiError::internal(id))?;
     let token = generate_opaque_token();
     let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     let mut tx = state
@@ -679,7 +864,7 @@ pub(crate) async fn start_github_manifest(
         manifest: serde_json::json!({
             "name": "Orbit",
             "url": origin,
-            "hook_attributes": { "url": format!("{origin}/api/v1/integrations/github/webhook"), "active": true },
+            "hook_attributes": { "url": format!("{origin}/api/v1/integrations/github/webhook"), "active": sync_mode.as_deref() != Some("polling") },
             "redirect_url": format!("{origin}/api/v1/integrations/github/manifest/callback"),
             "setup_url": format!("{origin}/settings/github?workspace={workspace}&github=installed"),
             "public": false,
@@ -876,15 +1061,11 @@ async fn github_webhook_from_database(
     let request_id = request.extensions().get::<RequestId>().cloned();
     let id = request_id.as_ref();
     check_github_binding(state, id).await?;
-    if request
+    let is_ping = request
         .headers()
         .get("x-github-event")
         .and_then(|value| value.to_str().ok())
-        == Some("ping")
-    {
-        // GitHub sends the first ping before the manifest callback can save the webhook secret.
-        return Ok(StatusCode::OK);
-    }
+        == Some("ping");
     let settings = github_settings_context(state, id)?;
     let key = app_key(settings, id)?;
     let signature = request
@@ -926,6 +1107,10 @@ async fn github_webhook_from_database(
     // Every delivery of a GitHub App names the App. Without it Orbit would have to try the secret
     // of every workspace, so one unsigned request would cost an HMAC per connected workspace.
     let Some(app_id) = app_id else {
+        if is_ping {
+            // The initial manifest ping can arrive before credentials have been saved.
+            return Ok(StatusCode::OK);
+        }
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_github_signature",
@@ -941,6 +1126,9 @@ async fn github_webhook_from_database(
     .fetch_all(state.tasks.database().pool())
     .await
     .map_err(|_| ApiError::internal(id))?;
+    if is_ping && rows.is_empty() {
+        return Ok(StatusCode::OK);
+    }
     let mut workspace = None;
     let mut unreadable = false;
     for row in &rows {
@@ -981,6 +1169,21 @@ async fn github_webhook_from_database(
             )
         }
     })?;
+    let mode: Option<(String, i64)> = sqlx::query_as(
+        "SELECT sync_mode, mode_epoch FROM github_workspace_settings WHERE workspace_id = $1",
+    )
+    .bind(&workspace)
+    .fetch_optional(state.tasks.database().pool())
+    .await
+    .map_err(|_| ApiError::internal(id))?;
+    let (mode, epoch) = mode.unwrap_or_else(|| ("webhooks".to_owned(), 1));
+    if mode == "polling" {
+        tracing::info!(workspace_id = %workspace, "ignored: workspace in polling mode");
+        return Ok(StatusCode::ACCEPTED);
+    }
+    if is_ping {
+        return Ok(StatusCode::OK);
+    }
     let payload: Value = serde_json::from_slice(&body).map_err(|_| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -992,7 +1195,7 @@ async fn github_webhook_from_database(
     })?;
     let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
     if matches!(event.as_str(), "installation" | "installation_repositories") {
-        update_github_installation(state, &workspace, &payload, &event, action, id).await?;
+        update_github_installation(state, &workspace, &payload, &event, action, id, epoch).await?;
         return Ok(StatusCode::OK);
     }
     if !matches!(event.as_str(), "issues" | "pull_request") {
@@ -1074,20 +1277,17 @@ async fn github_webhook_from_database(
         .collect();
     let connection = match selected.as_slice() {
         [] => {
-            let mut tx = state
-                .tasks
-                .database()
-                .immediate_transaction()
-                .await
-                .map_err(|_| ApiError::internal(id))?;
-            check_github_binding_tx(state, &mut tx, id).await?;
-            let paused = sqlx::query("UPDATE github_issue_links SET sync_paused = 1 WHERE workspace_id = $1 AND repository = $2 AND issue_number = $3 AND kind = $4 AND sync_paused = 0")
-                .bind(&workspace).bind(repository).bind(number).bind(kind)
-                .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
-            if paused.rows_affected() > 0 {
-                record_github_change(&mut tx, &workspace, "github.work_item.paused", id).await?;
-            }
-            tx.commit().await.map_err(|_| ApiError::internal(id))?;
+            pause_github_work_item_inner(
+                state,
+                &workspace,
+                repository,
+                number,
+                kind,
+                id,
+                None,
+                Some(epoch),
+            )
+            .await?;
             return Ok(StatusCode::ACCEPTED);
         }
         [connection] => connection,
@@ -1145,7 +1345,7 @@ async fn github_webhook_from_database(
     check_github_binding(state, id).await?;
     let synced = state
         .tasks
-        .sync_github_work_item(
+        .sync_github_webhook(
             workspace_id,
             actor_id,
             GithubWorkItem {
@@ -1160,11 +1360,16 @@ async fn github_webhook_from_database(
             },
             id.map_or("github-webhook", RequestId::as_str),
             TimestampMillis::now(),
+            epoch,
         )
         .await;
     if let Err(TaskError::TrialLimit(reached)) = &synced {
         // A 2xx keeps GitHub from disabling the hook; the change is dropped, as when read-only.
         tracing::info!(%workspace_id, event, detail = reached.detail(), "GitHub event dropped: trial limit reached");
+        return Ok(StatusCode::ACCEPTED);
+    }
+    if matches!(&synced, Ok(None)) {
+        tracing::info!(%workspace_id, "ignored: workspace in polling mode");
         return Ok(StatusCode::ACCEPTED);
     }
     synced.map_err(|cause| match cause {
@@ -1194,6 +1399,96 @@ async fn github_webhook_from_database(
     Ok(StatusCode::OK)
 }
 
+/// Pause a linked item when no configured project label matches an observation.
+pub(crate) async fn pause_github_work_item(
+    state: &IntegrationState,
+    workspace: &str,
+    repository: &str,
+    number: i64,
+    kind: &str,
+    request_id: Option<&RequestId>,
+) -> Result<(), ApiError> {
+    pause_github_work_item_inner(
+        state, workspace, repository, number, kind, request_id, None, None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Returns false when the poll lease is no longer current; no effects are committed.
+pub(crate) async fn pause_github_work_item_fenced(
+    state: &IntegrationState,
+    workspace: &str,
+    repository: &str,
+    number: i64,
+    kind: &str,
+    request_id: Option<&RequestId>,
+    fence: &PollFence,
+) -> Result<bool, ApiError> {
+    pause_github_work_item_inner(
+        state,
+        workspace,
+        repository,
+        number,
+        kind,
+        request_id,
+        Some(fence),
+        None,
+    )
+    .await
+}
+
+async fn pause_github_work_item_inner(
+    state: &IntegrationState,
+    workspace: &str,
+    repository: &str,
+    number: i64,
+    kind: &str,
+    request_id: Option<&RequestId>,
+    fence: Option<&PollFence>,
+    webhook_epoch: Option<i64>,
+) -> Result<bool, ApiError> {
+    let mut tx = state
+        .tasks
+        .database()
+        .immediate_transaction()
+        .await
+        .map_err(|_| ApiError::internal(request_id))?;
+    check_github_binding_tx(state, &mut tx, request_id).await?;
+    if let Some(epoch) = webhook_epoch
+        && !webhook_epoch_current(&mut tx, workspace, epoch)
+            .await
+            .map_err(|_| ApiError::internal(request_id))?
+    {
+        tracing::info!(workspace_id = %workspace, "ignored: workspace in polling mode");
+        return Ok(false);
+    }
+    if let Some(fence) = fence
+        && !poll_fence_current(&mut tx, state.tasks.database(), workspace, fence)
+            .await
+            .map_err(|_| ApiError::internal(request_id))?
+    {
+        return Ok(false);
+    }
+    let paused = sqlx::query("UPDATE github_issue_links SET sync_paused = 1 WHERE workspace_id = $1 AND repository = $2 AND issue_number = $3 AND kind = $4 AND sync_paused = 0")
+        .bind(workspace).bind(repository).bind(number).bind(kind)
+        .execute(&mut *tx).await.map_err(|_| ApiError::internal(request_id))?;
+    if paused.rows_affected() > 0 {
+        record_github_change(&mut tx, workspace, "github.work_item.paused", request_id).await?;
+    }
+    if let Some(fence) = fence
+        && !poll_fence_current(&mut tx, state.tasks.database(), workspace, fence)
+            .await
+            .map_err(|_| ApiError::internal(request_id))?
+    {
+        return Ok(false);
+    }
+    tx.commit()
+        .await
+        .map_err(|_| ApiError::internal(request_id))?;
+    Ok(true)
+}
+
 async fn update_github_installation(
     state: &IntegrationState,
     workspace: &str,
@@ -1201,6 +1496,7 @@ async fn update_github_installation(
     event: &str,
     action: &str,
     request_id: Option<&RequestId>,
+    epoch: i64,
 ) -> Result<(), ApiError> {
     let installation_id = payload
         .pointer("/installation/id")
@@ -1222,6 +1518,13 @@ async fn update_github_installation(
         .await
         .map_err(|_| ApiError::internal(request_id))?;
     check_github_binding_tx(state, &mut tx, request_id).await?;
+    if !webhook_epoch_current(&mut tx, workspace, epoch)
+        .await
+        .map_err(|_| ApiError::internal(request_id))?
+    {
+        tracing::info!(workspace_id = %workspace, "ignored: workspace in polling mode");
+        return Ok(());
+    }
     let mut changed = false;
     if event == "installation" && action == "deleted" {
         changed |= sqlx::query(
@@ -1630,6 +1933,12 @@ fn validation(field: &'static str, request_id: Option<&RequestId>) -> ApiError {
 pub(crate) struct ApiError {
     status: StatusCode,
     problem: Box<Problem>,
+}
+
+impl std::fmt::Debug for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ApiError").field("status", &self.status).finish()
+    }
 }
 
 impl ApiError {
