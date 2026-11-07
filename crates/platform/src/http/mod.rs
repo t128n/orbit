@@ -16,7 +16,7 @@ use axum::http::{Request, Response, StatusCode};
 use axum::response::Response as AxumResponse;
 use tower::{Layer, Service};
 
-use crate::{Database, Problem, RateLimitConfig};
+use crate::{Database, GitHubHost, Problem, RateLimitConfig};
 use rate_limit::RateLimiter;
 
 pub use limits::HttpLimits;
@@ -31,6 +31,7 @@ pub struct HttpPlatformLayer {
     limits: HttpLimits,
     contract_id: Option<String>,
     csp_script_hash: Option<String>,
+    csp_github_host: GitHubHost,
     rate_limiter: RateLimiter,
     secure_transport_required: bool,
 }
@@ -43,6 +44,7 @@ impl HttpPlatformLayer {
             limits: HttpLimits::default(),
             contract_id: None,
             csp_script_hash: None,
+            csp_github_host: GitHubHost::default(),
             rate_limiter: RateLimiter::default(),
             secure_transport_required: false,
         }
@@ -63,6 +65,13 @@ impl HttpPlatformLayer {
     #[must_use]
     pub fn with_csp_script_hash(mut self, hash: impl Into<String>) -> Self {
         self.csp_script_hash = Some(hash.into());
+        self
+    }
+
+    /// Allows GitHub App registration forms to submit to this validated GitHub host.
+    #[must_use]
+    pub fn with_csp_github_host(mut self, host: GitHubHost) -> Self {
+        self.csp_github_host = host;
         self
     }
 
@@ -104,6 +113,7 @@ impl<S> Layer<S> for HttpPlatformLayer {
             limits: self.limits,
             contract_id: self.contract_id.clone(),
             csp_script_hash: self.csp_script_hash.clone(),
+            csp_github_host: self.csp_github_host.clone(),
             rate_limiter: self.rate_limiter.clone(),
             secure_transport_required: self.secure_transport_required,
             readiness: InnerReadiness::Checking,
@@ -125,6 +135,7 @@ pub struct HttpPlatformService<S> {
     limits: HttpLimits,
     contract_id: Option<String>,
     csp_script_hash: Option<String>,
+    csp_github_host: GitHubHost,
     rate_limiter: RateLimiter,
     secure_transport_required: bool,
     readiness: InnerReadiness,
@@ -138,6 +149,7 @@ impl<S: Clone> Clone for HttpPlatformService<S> {
             limits: self.limits,
             contract_id: self.contract_id.clone(),
             csp_script_hash: self.csp_script_hash.clone(),
+            csp_github_host: self.csp_github_host.clone(),
             rate_limiter: self.rate_limiter.clone(),
             secure_transport_required: self.secure_transport_required,
             readiness: InnerReadiness::Checking,
@@ -180,6 +192,7 @@ where
         let limits = self.limits;
         let contract_id = self.contract_id.clone();
         let csp_script_hash = self.csp_script_hash.clone();
+        let csp_github_host = self.csp_github_host.clone();
         let rate_limiter = self.rate_limiter.clone();
         let secure_transport_required = self.secure_transport_required;
 
@@ -205,6 +218,7 @@ where
                         &request_id,
                         false,
                         csp_script_hash.as_deref(),
+                        &csp_github_host,
                     ));
                 }
             };
@@ -222,6 +236,7 @@ where
                     &request_id,
                     false,
                     csp_script_hash.as_deref(),
+                    &csp_github_host,
                 ));
             }
 
@@ -238,6 +253,7 @@ where
                     &request_id,
                     transport.is_secure(),
                     csp_script_hash.as_deref(),
+                    &csp_github_host,
                 ));
             }
 
@@ -259,6 +275,7 @@ where
                     &request_id,
                     transport.is_secure(),
                     csp_script_hash.as_deref(),
+                    &csp_github_host,
                 ));
             }
 
@@ -290,6 +307,7 @@ where
                         &request_id,
                         transport.is_secure(),
                         csp_script_hash.as_deref(),
+                        &csp_github_host,
                     ));
                 }
             };
@@ -300,6 +318,7 @@ where
                     &request_id,
                     transport.is_secure(),
                     csp_script_hash.as_deref(),
+                    &csp_github_host,
                 ));
             }
 
@@ -314,6 +333,7 @@ where
                     &request_id,
                     transport.is_secure(),
                     csp_script_hash.as_deref(),
+                    &csp_github_host,
                 ));
             }
 
@@ -352,6 +372,7 @@ where
                             &request_id,
                             transport.is_secure(),
                             csp_script_hash.as_deref(),
+                            &csp_github_host,
                         ));
                     }
                 },
@@ -370,6 +391,7 @@ where
                         &request_id,
                         transport.is_secure(),
                         csp_script_hash.as_deref(),
+                        &csp_github_host,
                     ));
                 }
             };
@@ -391,6 +413,7 @@ where
                 &request_id,
                 transport.is_secure(),
                 csp_script_hash.as_deref(),
+                &csp_github_host,
             ))
         })
     }
@@ -454,13 +477,19 @@ fn finish_response(
     request_id: &RequestId,
     secure: bool,
     csp_script_hash: Option<&str>,
+    csp_github_host: &GitHubHost,
 ) -> AxumResponse {
     let request_id = HeaderValue::from_str(request_id.as_str())
         .expect("validated request IDs are valid header values");
     response
         .headers_mut()
         .insert(HeaderName::from_static("x-request-id"), request_id);
-    add_security_headers(response.headers_mut(), secure, csp_script_hash);
+    add_security_headers(
+        response.headers_mut(),
+        secure,
+        csp_script_hash,
+        csp_github_host,
+    );
     response
 }
 

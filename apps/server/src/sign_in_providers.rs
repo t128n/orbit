@@ -83,6 +83,16 @@ impl Default for ProviderEndpoints {
 }
 
 impl ProviderEndpoints {
+    /// Derive GitHub endpoints from the configured host, retaining the Google endpoints.
+    #[must_use]
+    pub fn with_github_host(mut self, host: &orbit_platform::GitHubHost) -> Self {
+        self.github_authorize =
+            Url::parse(&host.oauth_authorize_url()).expect("validated GitHub URL");
+        self.github_token = Url::parse(&host.oauth_token_url()).expect("validated GitHub URL");
+        self.github_api = Url::parse(&format!("{}/", host.rest_base().trim_end_matches('/')))
+            .expect("validated GitHub URL");
+        self
+    }
     /// Every endpoint under `base`: `{base}/google/authorize`, `/google/token`, `/google/userinfo`,
     /// `/github/authorize`, `/github/token`, and the GitHub API at `{base}/github/api/`.
     #[must_use]
@@ -193,6 +203,10 @@ impl Default for ProviderClient {
 }
 
 impl ProviderClient {
+    #[must_use]
+    pub fn with_github_host(self, host: &orbit_platform::GitHubHost) -> Self {
+        Self::new(self.endpoints.with_github_host(host))
+    }
     #[must_use]
     pub fn new(endpoints: ProviderEndpoints) -> Self {
         let http = reqwest::Client::builder()
@@ -421,6 +435,33 @@ struct GithubEmail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enterprise_endpoints_keep_api_prefix_and_leave_google_alone() {
+        for (origin, api) in [
+            (
+                "https://git.example:8443",
+                "https://git.example:8443/api/v3/user",
+            ),
+            ("https://acme.ghe.com", "https://api.acme.ghe.com/user"),
+        ] {
+            let host: orbit_platform::GitHubHost = origin.parse().unwrap();
+            let endpoints = ProviderEndpoints::default().with_github_host(&host);
+            assert_eq!(
+                endpoints.github_authorize.as_str(),
+                format!("{origin}/login/oauth/authorize")
+            );
+            assert_eq!(
+                endpoints.github_token.as_str(),
+                format!("{origin}/login/oauth/access_token")
+            );
+            assert_eq!(endpoints.github_api.join("user").unwrap().as_str(), api);
+            assert_eq!(
+                endpoints.google_token.as_str(),
+                "https://oauth2.googleapis.com/token"
+            );
+        }
+    }
 
     #[test]
     fn pkce_challenge_matches_the_rfc_7636_example() {

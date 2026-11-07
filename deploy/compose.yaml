@@ -15,6 +15,7 @@ services:
       # Caddy, and loopback for the image healthcheck.
       ORBIT_TRUSTED_PROXIES: 127.0.0.1/32,172.30.0.2/32
       ORBIT_APP_KEY: ${ORBIT_APP_KEY:?Set ORBIT_APP_KEY in deploy/.env}
+      ORBIT_GITHUB_URL: ${ORBIT_GITHUB_URL:-https://github.com}
     volumes:
       - orbit-data:/var/lib/orbit
       - orbit-backups:/var/backups/orbit

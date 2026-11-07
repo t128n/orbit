@@ -5,6 +5,7 @@ mod backup;
 mod config;
 mod db;
 mod files;
+mod github;
 mod health;
 mod http;
 mod id;
@@ -48,6 +49,7 @@ pub use files::{
     UploadFinalization, UploadLimitError, UploadLimits, UploadService, WORKSPACE_STORAGE_USED,
     WorkspaceBucket,
 };
+pub use github::{GitHubHost, GitHubHostKind, InvalidGitHubHost};
 pub use health::{HealthCheck, HealthCheckResult, HealthRegistry, ReadinessReport};
 pub use http::{
     ClientIp, HttpLimits, HttpPlatformLayer, OriginPolicy, RequestId, RequestTransport,

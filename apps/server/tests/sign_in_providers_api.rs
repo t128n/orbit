@@ -224,6 +224,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let database = TestDatabase::new().await.unwrap();
+        orbit_server::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
+            .await
+            .unwrap();
         let identity = Arc::new(IdentityRepository::new((*database).clone()));
         let now = TimestampMillis::now();
         identity
@@ -432,6 +435,218 @@ fn web_handoff(location: &str) -> String {
         .unwrap()
         .1
         .into_owned()
+}
+
+#[tokio::test]
+async fn changed_github_binding_blocks_start_callback_and_pending_handoffs() {
+    let fixture = Fixture::new().await;
+    let (callback, verifier) = fixture
+        .through_callback(
+            "github",
+            "sign_in",
+            "web",
+            github(42, "owner@example.com"),
+            None,
+        )
+        .await;
+    fixture
+        .database
+        .execute(
+            "UPDATE github_host_binding SET origin = 'https://other.example' WHERE singleton = 1",
+        )
+        .await
+        .unwrap();
+    let start = fixture
+        .start(
+            "github",
+            json!({"intent": "sign_in", "code_challenge": challenge("v"), "redirect": "web"}),
+            None,
+        )
+        .await;
+    assert_eq!(start.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let callback_again = fixture
+        .send(
+            "GET",
+            "/api/v1/auth/providers/github/callback?state=unused&code=c",
+            None,
+            false,
+            None,
+        )
+        .await;
+    assert_eq!(callback_again.status, StatusCode::SEE_OTHER);
+    let exchange = fixture
+        .exchange(
+            &web_handoff(callback.location()),
+            &verifier,
+            Client::Web,
+            None,
+        )
+        .await;
+    assert_eq!(exchange.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let google_start = fixture
+        .start(
+            "google",
+            json!({"intent": "sign_in", "code_challenge": challenge("v"), "redirect": "web"}),
+            None,
+        )
+        .await;
+    assert_eq!(google_start.status, StatusCode::OK);
+    let challenge = fixture
+        .flow(
+            "google",
+            "sign_in",
+            google("g-owner", "owner@example.com"),
+            None,
+        )
+        .await;
+    assert_eq!(challenge.status, StatusCode::ACCEPTED);
+    let signed_in = fixture.link(&challenge, PASSWORD, Client::Web).await;
+    assert_eq!(signed_in.status, StatusCode::OK);
+    let save = fixture
+        .admin_save("github", json!({"client_id": "changed"}))
+        .await;
+    assert_eq!(save.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let remove = fixture
+        .send(
+            "DELETE",
+            "/api/v1/admin/settings/sign-in-providers/github",
+            Some(&fixture.owner_cookie),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(remove.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let google_save = fixture
+        .admin_save("google", json!({"client_id": "changed"}))
+        .await;
+    assert_eq!(google_save.status, StatusCode::OK);
+
+    fixture
+        .database
+        .execute("UPDATE github_host_binding SET origin = 'https://github.com' WHERE singleton = 1")
+        .await
+        .unwrap();
+    let retry = fixture
+        .exchange(
+            &web_handoff(callback.location()),
+            &verifier,
+            Client::Web,
+            None,
+        )
+        .await;
+    assert_eq!(retry.status, StatusCode::ACCEPTED, "{}", retry.body);
+}
+
+#[tokio::test]
+async fn github_identity_transactions_refuse_mismatched_binding() {
+    use orbit_platform::{AuthenticatedUser, GitHubHost, Id};
+    use orbit_server::sign_in_providers::{Provider, ProviderProfile};
+    let fixture = Fixture::new().await;
+    let user_id: Id = fixture
+        .database
+        .scalar::<String>("SELECT id FROM users WHERE email = 'owner@example.com'")
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    let user = AuthenticatedUser {
+        id: user_id,
+        email: "owner@example.com".to_owned(),
+        display_name: "Owner".to_owned(),
+    };
+    let profile = ProviderProfile {
+        provider: Provider::Github,
+        subject: "42".to_owned(),
+        verified_email: Some(user.email.clone()),
+        email: Some(user.email.clone()),
+        display_name: "octocat".to_owned(),
+    };
+    let host = GitHubHost::default();
+    let repo = IdentityRepository::new((*fixture.database).clone());
+    fixture
+        .database
+        .execute(
+            "UPDATE github_host_binding SET origin = 'https://other.example' WHERE singleton = 1",
+        )
+        .await
+        .unwrap();
+    let now = TimestampMillis::now();
+    assert!(
+        repo.provider_account(&profile, &host, "test", now)
+            .await
+            .is_err()
+    );
+    assert!(
+        repo.create_provider_session_audited(&user, &profile, &host, true, "test", now)
+            .await
+            .is_err()
+    );
+    assert!(
+        repo.connect_identity(user_id, &profile, &host, "test", now)
+            .await
+            .is_err()
+    );
+    assert!(
+        repo.confirm_with_provider(Id::new_v7(), user_id, &profile, &host, "test", now)
+            .await
+            .is_err()
+    );
+    assert!(
+        repo.disconnect_identity(user_id, Provider::Github, &host, "test", now)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .scalar_i64("SELECT COUNT(*) FROM user_identities")
+            .await,
+        0
+    );
+    assert_eq!(fixture.scalar_i64("SELECT COUNT(*) FROM sessions").await, 1);
+}
+
+#[tokio::test]
+async fn mismatched_github_binding_does_not_block_password_two_factor() {
+    let fixture = Fixture::new().await;
+    let setup = fixture
+        .send(
+            "POST",
+            "/api/v1/auth/two-factor/totp/setup",
+            Some(&fixture.owner_cookie),
+            true,
+            Some(json!({"password": PASSWORD})),
+        )
+        .await;
+    let secret = setup.body["secret"].as_str().unwrap();
+    let enabled = fixture
+        .send(
+            "POST",
+            "/api/v1/auth/two-factor/totp/enable",
+            Some(&fixture.owner_cookie),
+            true,
+            Some(json!({"code": totp_code(secret, -1)})),
+        )
+        .await;
+    assert_eq!(enabled.status, StatusCode::OK);
+    let login = fixture
+        .send(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            true,
+            Some(json!({"email": "owner@example.com", "password": PASSWORD})),
+        )
+        .await;
+    assert_eq!(login.status, StatusCode::ACCEPTED);
+    fixture
+        .database
+        .execute(
+            "UPDATE github_host_binding SET origin = 'https://other.example' WHERE singleton = 1",
+        )
+        .await
+        .unwrap();
+    let result = fixture.send("POST", "/api/v1/auth/login/two-factor", None, true, Some(json!({"two_factor_token": login.body["two_factor_token"], "code": totp_code(secret, 0)}))).await;
+    assert_eq!(result.status, StatusCode::OK, "{}", result.body);
 }
 
 #[tokio::test]

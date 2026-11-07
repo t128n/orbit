@@ -230,7 +230,18 @@ impl IdentityRepository {
 
     /// Records that a code for `step` was used, so the same code cannot sign in again. False when a code for this
     /// step or a newer one was already accepted.
-    pub async fn use_totp_step(&self, user_id: Id, step: i64) -> Result<bool, IdentityError> {
+    pub async fn use_totp_step(
+        &self,
+        user_id: Id,
+        step: i64,
+        github_host: Option<&orbit_platform::GitHubHost>,
+    ) -> Result<bool, IdentityError> {
+        let mut transaction = self.database().immediate_transaction().await?;
+        if let Some(host) = github_host {
+            crate::github_binding::check_in_transaction(&mut transaction, host)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
         let changed = sqlx::query(
             "UPDATE user_totp SET last_used_step = $1 \
              WHERE user_id = $2 AND enabled_at IS NOT NULL AND last_used_step < $3",
@@ -238,9 +249,10 @@ impl IdentityRepository {
         .bind(step)
         .bind(user_id.to_string())
         .bind(step)
-        .execute(self.database().pool())
+        .execute(&mut *transaction)
         .await?
         .rows_affected();
+        transaction.commit().await?;
         Ok(changed == 1)
     }
 
@@ -250,10 +262,16 @@ impl IdentityRepository {
         user_id: Id,
         code: &str,
         codes_key: &RecoveryCodeKey,
+        github_host: Option<&orbit_platform::GitHubHost>,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<bool, IdentityError> {
         let mut transaction = self.database().immediate_transaction().await?;
+        if let Some(host) = github_host {
+            crate::github_binding::check_in_transaction(&mut transaction, host)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
         // Codes made before the HMAC are stored as a plain SHA-256 and keep working until they are used or
         // replaced, so nobody loses their codes. Drop the second hash once no such rows are left.
         let used = sqlx::query(

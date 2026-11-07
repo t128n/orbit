@@ -64,6 +64,7 @@ pub struct WorkspaceState {
     image_compressor: Option<ImageCompressor>,
     /// Deletes stored files for workspace admins; `None` refuses to.
     uploads: Option<UploadService>,
+    github_host: orbit_platform::GitHubHost,
 }
 
 /// Open registration is throttled like sign-in, on every server of the database.
@@ -97,6 +98,7 @@ impl WorkspaceState {
             object_storage: None,
             image_compressor: None,
             uploads: None,
+            github_host: orbit_platform::GitHubHost::default(),
         }
     }
 
@@ -124,7 +126,14 @@ impl WorkspaceState {
             object_storage: None,
             image_compressor: None,
             uploads: None,
+            github_host: orbit_platform::GitHubHost::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_github_host(mut self, host: orbit_platform::GitHubHost) -> Self {
+        self.github_host = host;
+        self
     }
 
     #[must_use]
@@ -2401,6 +2410,7 @@ async fn save_sign_in_provider(
         .save_sign_in_provider(
             session.user.id,
             provider,
+            &state.github_host,
             client_id,
             encrypted,
             request_id_value(rid),
@@ -2433,6 +2443,7 @@ async fn remove_sign_in_provider(
         .remove_sign_in_provider(
             session.user.id,
             provider,
+            &state.github_host,
             request_id_value(rid),
             TimestampMillis::now(),
         )

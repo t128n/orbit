@@ -64,7 +64,7 @@ pub(super) enum ProviderRedirect {
 /// A provider flow from start to exchange.
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ProviderFlow {
-    provider: Provider,
+    pub(super) provider: Provider,
     intent: ProviderIntent,
     /// S256 of the verifier the starting client keeps; the exchange must bring the verifier.
     client_challenge: String,
@@ -194,6 +194,11 @@ pub(super) async fn start_provider_sign_in(
 ) -> Result<Json<StartProviderResponse>, ApiError> {
     let rid = request_id.as_ref();
     let provider = Provider::parse(&provider).ok_or_else(|| not_configured(START, rid))?;
+    if provider == Provider::Github {
+        crate::github_binding::check(state.database(), &state.github_host)
+            .await
+            .map_err(|_| ApiError::internal(START, rid))?;
+    }
     let credentials = credentials(&state, provider)
         .await
         .map_err(|_| ApiError::internal(START, rid))?
@@ -347,6 +352,13 @@ pub(super) async fn provider_callback(
         return expired();
     };
     if Provider::parse(&provider) != Some(flow.provider) {
+        return expired();
+    }
+    if flow.provider == Provider::Github
+        && crate::github_binding::check(state.database(), &state.github_host)
+            .await
+            .is_err()
+    {
         return expired();
     }
     let outcome = match (query.error, query.code) {
@@ -546,6 +558,9 @@ pub(super) async fn exchange_provider_sign_in(
             ));
         }
     };
+    if profile.provider != provider {
+        return Err(invalid_handoff(rid));
+    }
     match flow.intent {
         ProviderIntent::SignIn => sign_in(&state, &headers, profile, rid).await,
         ProviderIntent::Connect {
@@ -558,6 +573,7 @@ pub(super) async fn exchange_provider_sign_in(
                 .connect_identity(
                     user_id,
                     &profile,
+                    &state.github_host,
                     request_id_value(rid),
                     TimestampMillis::now(),
                 )
@@ -576,6 +592,7 @@ pub(super) async fn exchange_provider_sign_in(
                     session_id,
                     user_id,
                     &profile,
+                    &state.github_host,
                     request_id_value(rid),
                     TimestampMillis::now(),
                 )
@@ -599,7 +616,12 @@ async fn sign_in(
     };
     let account = match state
         .repository
-        .provider_account(&profile, request_id_value(rid), TimestampMillis::now())
+        .provider_account(
+            &profile,
+            &state.github_host,
+            request_id_value(rid),
+            TimestampMillis::now(),
+        )
         .await
     {
         Ok(account) => account,
@@ -643,6 +665,7 @@ async fn finish_sign_in(
         .create_provider_session_audited(
             &user,
             &profile,
+            &state.github_host,
             link,
             request_id_value(rid),
             TimestampMillis::now(),
@@ -958,6 +981,7 @@ pub(super) async fn disconnect_connected_account(
         .disconnect_identity(
             session.user.id,
             provider,
+            &state.github_host,
             request_id_value(rid),
             TimestampMillis::now(),
         )

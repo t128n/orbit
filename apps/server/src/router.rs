@@ -18,19 +18,20 @@ use crate::export_routes::{ExportState, export_router};
 use crate::import_routes::{ImportState, import_router};
 use crate::integration_routes::{IntegrationState, integration_router};
 use crate::linear_import_routes::{LinearImportState, linear_import_router};
+use crate::obsidian_import_routes::{ObsidianImportState, obsidian_import_router};
 use crate::page_comment_routes::{PageCommentState, page_comment_router};
 use crate::page_file_routes::{PageFileState, page_file_router};
 use crate::page_routes::{PageState, page_router};
 use crate::static_assets::StaticAssets;
 use crate::task_routes::{TaskState, task_router};
 use crate::teamspace_routes::{TeamspaceState, teamspace_router};
-use crate::obsidian_import_routes::{ObsidianImportState, obsidian_import_router};
 use crate::trello_import_routes::{TrelloImportState, trello_import_router};
 use crate::view_routes::view_router;
 use crate::workspace_export_routes::{WorkspaceExportState, workspace_export_router};
 use crate::workspace_routes::{WorkspaceState, workspace_router};
 
 pub struct ApiRoutes {
+    pub github_host: orbit_platform::GitHubHost,
     /// Orbit Cloud billing: its routes and the read-only guard. `None` on a self-hosted server.
     pub billing: Option<crate::billing::Billing>,
     pub mcp: Router,
@@ -66,6 +67,7 @@ pub fn production_router(
     rate_limits: RateLimitConfig,
     require_secure_transport: bool,
 ) -> Router {
+    let github_host = api.github_host.clone();
     let csp_script_hash = assets.csp_script_hash().to_owned();
     let session_cookie = api.auth.cookie_mode().session_cookie_name();
     let database = api.auth.database().clone();
@@ -125,6 +127,7 @@ pub fn production_router(
             .with_rate_limits(rate_limits)
             .with_session_cookie(session_cookie)
             .with_shared_rate_limits(database)
+            .with_csp_github_host(github_host)
             .with_csp_script_hash(csp_script_hash);
         if require_secure_transport {
             layer.require_secure_transport()

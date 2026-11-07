@@ -27,6 +27,9 @@ impl Fixture {
 
     async fn with_state(configure: impl FnOnce(AuthState) -> AuthState) -> Self {
         let database = TestDatabase::new().await.unwrap();
+        orbit_server::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
+            .await
+            .unwrap();
         let identity = Arc::new(IdentityRepository::new((*database).clone()));
         let now = TimestampMillis::now();
         identity

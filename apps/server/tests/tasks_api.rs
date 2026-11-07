@@ -30,6 +30,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let database = TestDatabase::new().await.unwrap();
+        orbit_server::github_binding::bind(&database, &Default::default())
+            .await
+            .unwrap();
         let identity = Arc::new(IdentityRepository::new((*database).clone()));
         let now = TimestampMillis::now();
         identity
@@ -93,6 +96,120 @@ impl Fixture {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         response_json(response).await
+    }
+}
+
+#[tokio::test]
+async fn enterprise_github_links_use_bound_host_and_reject_mismatch() {
+    for origin in ["https://git.example:8443", "https://acme.ghe.com"] {
+        let fixture = Fixture::new().await;
+        sqlx::query("UPDATE github_host_binding SET origin = $1 WHERE singleton = 1")
+            .bind(origin)
+            .execute(fixture.database.pool())
+            .await
+            .unwrap();
+        let host = origin.parse().unwrap();
+        let repository =
+            Arc::new(TaskRepository::new((*fixture.database).clone()).with_github_host(host));
+        let workspace = fixture.workspace_id.parse().unwrap();
+        let project = fixture.project_id.parse().unwrap();
+        let work_item = |kind, number| GithubWorkItem {
+            repository: "acme/repo".into(),
+            number,
+            project_id: project,
+            title: "GitHub task".into(),
+            description: String::new(),
+            kind,
+            state: "open",
+            state_changed: false,
+        };
+        for (kind, number, path) in [("issue", 12, "issues"), ("pull_request", 8, "pull")] {
+            let task_id = repository
+                .sync_github_work_item(
+                    workspace,
+                    fixture.owner_id,
+                    work_item(kind, number),
+                    "test",
+                    TimestampMillis::now(),
+                )
+                .await
+                .unwrap();
+            let stored: String = sqlx::query_scalar("SELECT source_url FROM tasks WHERE id = $1")
+                .bind(task_id.to_string())
+                .fetch_one(fixture.database.pool())
+                .await
+                .unwrap();
+            assert_eq!(stored, format!("{origin}/acme/repo/{path}/{number}"));
+            let app = task_router(TaskState::with_repository(
+                Arc::clone(&fixture.identity),
+                Arc::clone(&repository),
+                CookieMode::secure(),
+            ));
+            let uri = format!(
+                "/api/v1/workspaces/{}/tasks/{task_id}/github-links",
+                fixture.workspace_id
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header(header::COOKIE, &fixture.owner_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_json(response).await[0]["url"], stored);
+            sqlx::query("UPDATE tasks SET source_url = $1 WHERE id = $2")
+                .bind("https://old.example/kept")
+                .bind(task_id.to_string())
+                .execute(fixture.database.pool())
+                .await
+                .unwrap();
+            repository
+                .sync_github_work_item(
+                    workspace,
+                    fixture.owner_id,
+                    work_item(kind, number),
+                    "test",
+                    TimestampMillis::now(),
+                )
+                .await
+                .unwrap();
+            let retained: String = sqlx::query_scalar("SELECT source_url FROM tasks WHERE id = $1")
+                .bind(task_id.to_string())
+                .fetch_one(fixture.database.pool())
+                .await
+                .unwrap();
+            assert_eq!(retained, "https://old.example/kept");
+            let mismatch = fixture
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header(header::COOKIE, &fixture.owner_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(mismatch.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let wrong = TaskRepository::new((*fixture.database).clone());
+        assert!(
+            wrong
+                .sync_github_work_item(
+                    workspace,
+                    fixture.owner_id,
+                    work_item("issue", 99),
+                    "test",
+                    TimestampMillis::now()
+                )
+                .await
+                .is_err()
+        );
     }
 }
 

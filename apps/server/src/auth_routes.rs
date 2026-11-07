@@ -186,11 +186,23 @@ pub struct AuthState {
     public_origin: Arc<str>,
     /// Google and GitHub over HTTP.
     providers: crate::sign_in_providers::ProviderClient,
+    github_host: orbit_platform::GitHubHost,
     /// Where a native provider sign-in may return to.
     native_redirects: Arc<crate::sign_in_providers::NativeRedirects>,
 }
 
 impl AuthState {
+    /// Configure the GitHub OAuth host and its persistent identity binding.
+    #[must_use]
+    pub fn with_github_host(mut self, host: orbit_platform::GitHubHost) -> Self {
+        self.providers = self.providers.with_github_host(&host);
+        self.pending = Arc::new(two_factor::PendingStore::new(
+            self.database().clone(),
+            host.clone(),
+        ));
+        self.github_host = host;
+        self
+    }
     #[must_use]
     pub fn with_mailer(mut self, mailer: Mailer) -> Self {
         self.mailer = Some(mailer);
@@ -286,7 +298,10 @@ impl AuthState {
         let dummy_hash = passwords
             .hash("not a real account password")
             .expect("the static dummy password satisfies policy");
-        let pending = Arc::new(two_factor::PendingStore::new(repository.database().clone()));
+        let pending = Arc::new(two_factor::PendingStore::new(
+            repository.database().clone(),
+            orbit_platform::GitHubHost::default(),
+        ));
         let throttler = Arc::new(throttle::SharedThrottler::new(
             "login",
             repository.database().clone(),
@@ -307,6 +322,7 @@ impl AuthState {
             billing_enabled: false,
             public_origin: Arc::from(""),
             providers: crate::sign_in_providers::ProviderClient::default(),
+            github_host: orbit_platform::GitHubHost::default(),
             native_redirects: Arc::default(),
         }
     }

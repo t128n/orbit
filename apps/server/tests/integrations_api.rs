@@ -20,6 +20,69 @@ use sha2::Sha256;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn enterprise_manifest_and_binding_guard() {
+    let fixture = fixture().await;
+    let host: orbit_platform::GitHubHost = "https://github.enterprise.test".parse().unwrap();
+    sqlx::query("UPDATE github_host_binding SET origin = $1 WHERE singleton = 1")
+        .bind(host.web_origin())
+        .execute(fixture.database.pool())
+        .await
+        .unwrap();
+    let state = IntegrationState::new(
+        Arc::new(fixture.tokens.clone()),
+        Arc::new(TaskRepository::new((*fixture.database).clone())),
+    )
+    .with_github_settings(
+        Arc::new(IdentityRepository::new((*fixture.database).clone())),
+        CookieMode::secure(),
+        "https://orbit.test".to_owned(),
+        false,
+        Some([7; 32]),
+    )
+    .with_github_host(host);
+    let app = integration_router(state);
+    let path = format!(
+        "/api/v1/workspaces/{}/github/manifest",
+        fixture.workspace_id
+    );
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header(header::COOKIE, &fixture.session_cookie)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"organization":"acme"}"#))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response_json(response).await["action"]
+            .as_str()
+            .unwrap()
+            .starts_with(
+                "https://github.enterprise.test/organizations/acme/settings/apps/new?state="
+            )
+    );
+    sqlx::query("UPDATE github_host_binding SET origin = $1 WHERE singleton = 1")
+        .bind("https://github.com")
+        .execute(fixture.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        app.oneshot(github_request("ping", json!({}), true))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
 async fn database_github_app_routes_issues_without_orbit_tokens() {
     let fixture = fixture().await;
     let key = [7u8; 32];
@@ -1724,6 +1787,9 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let database = TestDatabase::new().await.unwrap();
+    orbit_server::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
+        .await
+        .unwrap();
     let identity = IdentityRepository::new((*database).clone());
     let now = TimestampMillis::now();
     identity
