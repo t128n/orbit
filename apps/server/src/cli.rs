@@ -88,6 +88,23 @@ pub enum Command {
         #[command(subcommand)]
         command: SetupTokenCommand,
     },
+    /// Run Orbit as a native Windows Service (Windows only).
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+}
+
+/// Windows only: registers Orbit with the Service Control Manager so it starts automatically
+/// and restarts under `services.msc`, `sc.exe` or `Start-Service`/`Stop-Service`.
+#[cfg(windows)]
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Register Orbit as a Windows Service (automatic start, LocalSystem account).
+    Install,
+    /// Remove Orbit's Windows Service registration.
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -187,6 +204,18 @@ pub async fn run(cli: Cli, env: BTreeMap<String, String>) -> Result<String, CliE
         Command::Root { command } => root(config()?, command).await,
         Command::Openapi { output } => write_openapi(output),
         Command::SetupToken { command } => setup_token(config()?, command).await,
+        #[cfg(windows)]
+        Command::Service { command } => service(command),
+    }
+}
+
+#[cfg(windows)]
+fn service(command: &ServiceCommand) -> Result<String, CliError> {
+    match command {
+        ServiceCommand::Install => crate::windows_service::install().map_err(CliError::Operation),
+        ServiceCommand::Uninstall => {
+            crate::windows_service::uninstall().map_err(CliError::Operation)
+        }
     }
 }
 
@@ -1316,6 +1345,10 @@ pub fn redacted_config(config: &Config) -> String {
     match config.metrics.listen {
         Some(listen) => lines.push(format!("ORBIT_METRICS_LISTEN={listen}")),
         None => lines.push("# ORBIT_METRICS_LISTEN is not set: metrics are disabled".to_owned()),
+    }
+    match &config.log_file {
+        Some(path) => lines.push(format!("ORBIT_LOG_FILE={}", path.display())),
+        None => lines.push("# ORBIT_LOG_FILE is not set: logs go to stdout".to_owned()),
     }
     if config.app_key.is_some() {
         lines.push("ORBIT_APP_KEY=[REDACTED]".to_owned());

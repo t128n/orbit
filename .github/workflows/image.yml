@@ -128,9 +128,46 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Bare-metal Windows deployment gets a native binary too: no Docker, no musl, no cargo-chef
+  # layer cache. The web frontend and the Rust workspace both build natively on windows-latest.
+  windows-binary:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile --filter web
+      - name: Build the web frontend
+        working-directory: apps/web
+        env:
+          ORBIT_BUILD_REVISION: ${{ github.sha }}
+        run: bun run build
+      - name: Run the platform and server unit tests
+        run: cargo test --locked -p orbit-platform -p orbit-server --lib
+      - name: Build the release binary
+        run: cargo build --locked --release -p orbit-server
+      - run: ./target/release/orbit.exe --help
+      - name: Package the release binary
+        if: github.event_name == 'release'
+        run: Compress-Archive -Path target/release/orbit.exe -DestinationPath orbit-windows-x86_64.zip
+      - name: Keep release binary for the release job
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v7
+        with:
+          name: orbit-windows-x86_64
+          path: orbit-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 1
+
   release-binaries:
     if: github.event_name == 'release'
-    needs: [version, image]
+    needs: [version, image, windows-binary]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -139,12 +176,16 @@ jobs:
         with:
           pattern: orbit-linux-*
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: orbit-windows-*
+          merge-multiple: true
       - name: Attach binaries and checksums to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          files=(orbit-linux-x86_64.tar.xz orbit-linux-aarch64.tar.xz)
+          files=(orbit-linux-x86_64.tar.xz orbit-linux-aarch64.tar.xz orbit-windows-x86_64.zip)
           sha256sum "${files[@]}" | tee SHA256SUMS
           # --clobber replaces the files when the workflow runs again for the same release.
           gh release upload "$TAG" "${files[@]}" SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"

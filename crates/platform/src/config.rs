@@ -26,6 +26,7 @@ const JOBS_CONCURRENCY_ENV: &str = "ORBIT_JOBS_CONCURRENCY";
 const UPLOADS_MAX_FILE_BYTES_ENV: &str = "ORBIT_UPLOAD_MAX_FILE_BYTES";
 const UPLOADS_MAX_REQUEST_BYTES_ENV: &str = "ORBIT_UPLOAD_MAX_REQUEST_BYTES";
 const METRICS_LISTEN_ENV: &str = "ORBIT_METRICS_LISTEN";
+const LOG_FILE_ENV: &str = "ORBIT_LOG_FILE";
 const RATE_LIMITS_ENV_PREFIX: &str = "ORBIT_RATE_LIMIT_";
 const APP_KEY_ENV: &str = "ORBIT_APP_KEY";
 const APP_KEY_FILE_ENV: &str = "ORBIT_APP_KEY_FILE";
@@ -52,6 +53,9 @@ pub struct Config {
     pub uploads: UploadConfig,
     pub metrics: MetricsConfig,
     pub rate_limits: RateLimitConfig,
+    /// Where to write logs instead of stdout (`ORBIT_LOG_FILE`). Stdout is not visible when
+    /// Orbit runs as a Windows Service, so a bare-metal Windows deployment needs this set.
+    pub log_file: Option<PathBuf>,
     /// The key for secrets saved in the database (`ORBIT_APP_KEY`). Required: [`Config::validate`]
     /// refuses a configuration without it.
     pub app_key: Option<AppKey>,
@@ -860,6 +864,8 @@ fn apply_environment(
             config.uploads.max_request_bytes = parse_environment(key, value)?;
         } else if key == METRICS_LISTEN_ENV {
             config.metrics.listen = Some(parse_environment(key, value)?);
+        } else if key == LOG_FILE_ENV {
+            config.log_file = Some(PathBuf::from(value));
         } else if let Some(setting) = key
             .strip_prefix(RATE_LIMITS_ENV_PREFIX)
             .and_then(|name| config.rate_limits.setting_mut(&name.to_ascii_lowercase()))
@@ -996,6 +1002,17 @@ mod tests {
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
         );
         Config::from_environment(env).unwrap()
+    }
+
+    #[test]
+    fn log_file_is_unset_by_default_and_reads_from_the_environment() {
+        let config = production(&[]);
+        assert_eq!(config.log_file, None);
+        let config = production(&[("ORBIT_LOG_FILE", "C:\\ProgramData\\Orbit\\logs\\orbit.log")]);
+        assert_eq!(
+            config.log_file,
+            Some(PathBuf::from("C:\\ProgramData\\Orbit\\logs\\orbit.log"))
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ Orbit reads its configuration only from environment variables that start with `O
 | `ORBIT_UPLOAD_MAX_FILE_BYTES` | `26214400` (25 MiB) | |
 | `ORBIT_UPLOAD_MAX_REQUEST_BYTES` | `104857600` (100 MiB) | |
 | `ORBIT_METRICS_LISTEN` | none (metrics off) | A private listener, for example `127.0.0.1:9090`. `/metrics` has no authentication: never send it through the public site. Orbit logs a warning at startup when the address is not loopback; then only the monitoring network may reach it. |
+| `ORBIT_LOG_FILE` | none (stdout) | Appends logs to this file instead of stdout. Needed on [Windows Server](#windows-server-bare-metal): a Windows Service has no console, so stdout is unreachable. |
 | `ORBIT_RATE_LIMIT_*` | see notes | Request limits and email caps. See [Request limits and email caps](#request-limits-and-email-caps). |
 | `ORBIT_APP_KEY` | none | **Required.** The key for saved secrets: base64 of 32 random bytes. |
 | `ORBIT_APP_KEY_FILE` | none | The path of a file that contains the app key, instead of `ORBIT_APP_KEY`. Do not set both. |
@@ -162,6 +163,47 @@ Orbit uses these rules:
 ### Native app redirects
 
 The mobile app receives the result at `orbit://auth/callback`. Orbit accepts no other redirect in production. For Expo Go in development, set `ORBIT_DEV_NATIVE_REDIRECTS` to the exact Expo URLs, separated by commas, for example `exp://100.64.0.5:8082/--/auth/callback`. Orbit compares each URL exactly. Orbit does not start when `ORBIT_ENV=production` and this variable is set.
+
+## Windows Server (bare metal)
+
+Orbit runs as a native Windows binary: no Docker, no WSL, SQLite by default. Download `orbit-windows-x86_64.zip` from a [release](https://github.com/coollabsio/orbit/releases) (or build it with `cargo build --release -p orbit-server` after `bun run build` in `apps/web`) and put `orbit.exe` somewhere permanent, for example `C:\Orbit\orbit.exe`.
+
+**Layout.** There is no `/var/lib` convention on Windows; use `C:\ProgramData\Orbit` (writable by `LocalSystem`, survives user profile changes):
+
+| Variable | Suggested value |
+|---|---|
+| `ORBIT_DATABASE_PATH` | `C:\ProgramData\Orbit\data\orbit.sqlite` |
+| `ORBIT_ATTACHMENTS_PATH` | `C:\ProgramData\Orbit\data\attachments` |
+| `ORBIT_BACKUPS_PATH` | `C:\ProgramData\Orbit\backups` |
+| `ORBIT_LOG_FILE` | `C:\ProgramData\Orbit\logs\orbit.log` |
+
+**Configuration.** Orbit still reads only `ORBIT_*` environment variables (see [Configuration](#configuration)); there is no `.env` file. Set them machine-wide, from an elevated PowerShell, before installing the service:
+
+```powershell
+[Environment]::SetEnvironmentVariable("ORBIT_ENV", "production", "Machine")
+[Environment]::SetEnvironmentVariable("ORBIT_APP_KEY", "<openssl rand -base64 32>", "Machine")
+[Environment]::SetEnvironmentVariable("ORBIT_PUBLIC_ORIGIN", "https://orbit.example.com", "Machine")
+[Environment]::SetEnvironmentVariable("ORBIT_TRUSTED_PROXIES", "127.0.0.1/32", "Machine")
+[Environment]::SetEnvironmentVariable("ORBIT_DATABASE_PATH", "C:\ProgramData\Orbit\data\orbit.sqlite", "Machine")
+[Environment]::SetEnvironmentVariable("ORBIT_ATTACHMENTS_PATH", "C:\ProgramData\Orbit\data\attachments", "Machine")
+[Environment]::SetEnvironmentVariable("ORBIT_BACKUPS_PATH", "C:\ProgramData\Orbit\backups", "Machine")
+[Environment]::SetEnvironmentVariable("ORBIT_LOG_FILE", "C:\ProgramData\Orbit\logs\orbit.log", "Machine")
+```
+
+The Service Control Manager rebuilds a service's environment from these machine variables each time it starts the service, so a plain service restart picks up a change; no reboot needed. `ORBIT_LOG_FILE` matters specifically on Windows: a service has no console, so anything Orbit would otherwise write to stdout is simply unreachable.
+
+**Install and run as a Windows Service**, from an elevated prompt (`orbit service install` needs permission to register with the Service Control Manager):
+
+```powershell
+orbit.exe service install   # registers "Orbit": automatic start, LocalSystem account
+sc.exe start Orbit          # or: Start-Service Orbit, or Services (services.msc)
+```
+
+Orbit's control handler turns a Service Control Manager stop (`sc.exe stop Orbit`, `Stop-Service Orbit`, shutdown) into the same graceful drain described in [Orbit Cloud: Stopping a server](#deployment): HTTP finishes in-flight requests and background jobs stop claiming new work before the process exits. `orbit.exe service uninstall` removes the registration (stopping the service first if needed). To upgrade, stop the service, replace `orbit.exe`, start it again; reinstalling is not necessary unless the executable's path changes.
+
+**Reverse proxy.** Production still requires an HTTPS public origin and `ORBIT_TRUSTED_PROXIES` (see [Configuration](#configuration)): put [Caddy](https://caddyserver.com/docs/install#windows) or IIS with Application Request Routing in front of Orbit's HTTP listener for TLS termination, same as the Linux deployment. Open the port with `New-NetFirewallRule -DisplayName "Orbit" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow` if the proxy runs on another host.
+
+Everything else — `orbit config check`, `orbit migrate`, `orbit backup create` / `restore`, `orbit healthcheck`, the setup token, root user and recovery-link commands — works identically to the Linux binary; see the rest of this document.
 
 ## Postgres
 

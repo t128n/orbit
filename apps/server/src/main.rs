@@ -1,4 +1,6 @@
 mod cli;
+#[cfg(windows)]
+mod windows_service;
 
 use std::future::Future;
 use std::process::ExitCode;
@@ -7,6 +9,17 @@ use std::time::Duration;
 use clap::Parser;
 
 fn main() -> ExitCode {
+    // The Service Control Manager starts Orbit with exactly this one argument (set at
+    // `orbit service install` time). It must dispatch on a plain thread, before Tokio or clap
+    // exist: `windows_service::dispatch` blocks this thread for the life of the service and
+    // builds its own Tokio runtime once the Service Control Manager hands control back to us.
+    #[cfg(windows)]
+    {
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        if windows_service::is_dispatch_invocation(&args) {
+            return windows_service::dispatch();
+        }
+    }
     run_with_bounded_runtime(run())
 }
 
@@ -31,7 +44,8 @@ async fn run() -> ExitCode {
     } else {
         orbit_platform::TracingFormat::Json
     };
-    let _ = orbit_platform::init_tracing(format);
+    let log_file = std::env::var_os("ORBIT_LOG_FILE").map(std::path::PathBuf::from);
+    let _ = orbit_platform::init_tracing(format, log_file.as_deref());
     match cli::run(cli::Cli::parse(), std::env::vars().collect()).await {
         Ok(output) => {
             if !output.is_empty() {

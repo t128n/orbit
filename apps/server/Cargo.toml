@@ -63,3 +63,6 @@ sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
 tempfile = "3"
 zstd = "0.14"
 tokio-tungstenite = "0.29"
+
+[target."cfg(windows)".dependencies]
+windows-service = "0.8.1"

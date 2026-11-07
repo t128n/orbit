@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{Datelike, TimeZone, Utc};
 use fs2::FileExt;
@@ -464,10 +464,7 @@ impl BackupService {
                 None,
             )?;
 
-            let staged_database_lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&staged_database)
+            let staged_database_lock = open_staged_database_lock(&staged_database)
                 .map_err(|source| io_error(&staged_database, source))?;
             staged_database_lock
                 .try_lock_exclusive()
@@ -490,7 +487,7 @@ impl BackupService {
 
             let switch_result: Result<(), BackupError> = (|| {
                 if database_existed {
-                    fs::rename(&database_path, &old_database)
+                    retrying_rename(&database_path, &old_database)
                         .map_err(|source| io_error(&database_path, source))?;
                     database_old_moved = true;
                 } else {
@@ -501,22 +498,22 @@ impl BackupService {
                     let original = sidecar_path(&database_path, suffix);
                     if original.exists() {
                         let preserved = sidecar_path(&old_database, suffix);
-                        fs::rename(&original, &preserved)
+                        retrying_rename(&original, &preserved)
                             .map_err(|source| io_error(&original, source))?;
                         moved_sidecars.push((original, preserved));
                     }
                 }
-                fs::rename(&staged_database, &database_path)
+                retrying_rename(&staged_database, &database_path)
                     .map_err(|source| io_error(&database_path, source))?;
                 database_new_installed = true;
 
                 if attachment_path.exists() {
-                    fs::rename(&attachment_path, &old_attachments)
+                    retrying_rename(&attachment_path, &old_attachments)
                         .map_err(|source| io_error(&attachment_path, source))?;
                     attachments_old_moved = true;
                 }
                 late_hook()?;
-                fs::rename(&staged_attachments, &attachment_path)
+                retrying_rename(&staged_attachments, &attachment_path)
                     .map_err(|source| io_error(&attachment_path, source))?;
                 attachments_new_installed = true;
                 Ok(())
@@ -1317,7 +1314,7 @@ fn rollback_restore(
     if attachments_old_moved {
         capture_error(
             &mut first_error,
-            fs::rename(old_attachments, attachment_path)
+            retrying_rename(old_attachments, attachment_path)
                 .map_err(|source| io_error(attachment_path, source)),
         );
     }
@@ -1327,14 +1324,14 @@ fn rollback_restore(
     if database_old_moved {
         capture_error(
             &mut first_error,
-            fs::rename(old_database, database_path)
+            retrying_rename(old_database, database_path)
                 .map_err(|source| io_error(database_path, source)),
         );
     }
     for (original, preserved) in moved_sidecars.iter().rev() {
         capture_error(
             &mut first_error,
-            fs::rename(preserved, original).map_err(|source| io_error(original, source)),
+            retrying_rename(preserved, original).map_err(|source| io_error(original, source)),
         );
     }
     match first_error {
@@ -1436,6 +1433,56 @@ fn io_error(path: impl Into<PathBuf>, source: std::io::Error) -> BackupError {
         path: path.into(),
         source,
     }
+}
+
+/// Renames a file or directory, retrying briefly on Windows if antivirus real-time protection
+/// (on by default, including on Windows Server) is still scanning it: that holds a transient
+/// sharing lock on a just-written or just-renamed file for a few milliseconds, which POSIX has
+/// no equivalent of. Elsewhere, or for any other error, the first attempt's result returns
+/// immediately.
+fn retrying_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 10;
+    let mut delay = Duration::from_millis(10);
+    for attempt in 1..=ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < ATTEMPTS && is_transient_sharing_violation(&error) => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop above always returns by its last attempt")
+}
+
+#[cfg(windows)]
+fn is_transient_sharing_violation(error: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+    matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
+#[cfg(not(windows))]
+fn is_transient_sharing_violation(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Opens the staged database for the advisory restore lock. Unlike POSIX, Windows refuses to
+/// rename a file while a handle to it is open unless that handle allows it: the restore switch
+/// below renames this very file into place while `staged_database_lock` is still held, so the
+/// handle needs `FILE_SHARE_DELETE` (POSIX has no such restriction and needs no equivalent).
+fn open_staged_database_lock(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    options.open(path)
 }
 
 /// A restored database is older than the collaborative documents open clients still hold, which
