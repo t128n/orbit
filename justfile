@@ -144,6 +144,6 @@ build:
 version *new:
     bash scripts/version.sh {{ new }}
 
-release-image tag=("orbit:" + `bash scripts/version.sh`):
+release-image tag=("orbit:" + `bash scripts/version.sh | tr '+' '-'`):
     docker build --build-arg ORBIT_BUILD_REVISION="$(git rev-parse HEAD)" -t "{{ tag }}" .
     docker run --rm "{{ tag }}" --help

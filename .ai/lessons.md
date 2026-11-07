@@ -77,6 +77,7 @@
 - Under bun + happy-dom, a failing `toBeNull()` on an element or a failing `waitFor` on a full page can exhaust a 4 GB memory cap with no output. Assert negatives by count and keep rendered page tests focused.
 - happy-dom has no layout, so a TanStack Virtual list mounts no rows in tests. Put `data-virtual-scroller` on the scroll element: `src/test/dom.ts` gives it a height (and each `data-index` line 1px). Positions in such tests are line indexes in px.
 - Tailwind v4 emits variant rules in its own order, not class order: two `data-[…]:` variants that set the same property (e.g. `top`) at equal specificity can resolve the wrong way. Make such variants mutually exclusive instead of relying on override order.
+- SemVer build metadata (`+`) in version strings (e.g. `0.2.1+1`): Cargo, npm/Bun, Git tags, and GitHub releases support `+`. Docker image tags strictly reject `+` (OCI reference grammar forbids it); sanitize `+` to `-` in Docker tag scripts.
 
 ## HTML5 drag and drop: never unmount the drag source on dragstart
 - Symptom: kanban cards went invisible while dragging and no drop indicator appeared.
