@@ -41,6 +41,8 @@ jobs:
   windows-binary:
     needs: version
     runs-on: windows-latest
+    env:
+      ORBIT_BUILD_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -53,8 +55,6 @@ jobs:
       - run: bun install --frozen-lockfile --filter web
       - name: Build the web frontend
         working-directory: apps/web
-        env:
-          ORBIT_BUILD_REVISION: ${{ github.sha }}
         run: bun run build
       - name: Run the platform and server unit tests
         run: cargo test --locked -p orbit-platform -p orbit-server --lib
