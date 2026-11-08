@@ -22,6 +22,12 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      # Orbit-CX features live in orbit-cx/patches/, so read the version from the same
+      # patched tree that the Windows job builds. See orbit-cx/docs/patches.md.
+      - name: Verify the Orbit-CX patch series
+        run: bash orbit-cx/scripts/apply-patches.sh --check
+      - name: Apply the Orbit-CX patch series
+        run: bash orbit-cx/scripts/apply-patches.sh
       - name: Read version from Cargo.toml
         id: version
         env:
@@ -44,7 +50,17 @@ jobs:
     env:
       ORBIT_BUILD_REVISION: ${{ github.sha }}
     steps:
+      # The patch files use LF endings; keep Git for Windows from rewriting the checkout.
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+      # Apply the patch series before building, so the released binary contains the Orbit-CX
+      # features. See orbit-cx/docs/patches.md.
+      - name: Verify the Orbit-CX patch series
+        shell: pwsh
+        run: ./orbit-cx/scripts/apply-patches.ps1 -Check
+      - name: Apply the Orbit-CX patch series
+        shell: pwsh
+        run: ./orbit-cx/scripts/apply-patches.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
