@@ -1,0 +1,73 @@
+From a7001217cf436734e3674f6aaa797f492ba07413 Mon Sep 17 00:00:00 2001
+From: Torben Haack <t128n@ipv4.8shield.net>
+Date: Sat, 7 Nov 2026 21:51:58 +0100
+Subject: [PATCH] chore: support counter build metadata in versioning scripts
+
+Support counter build metadata in versioning scripts for SemVer compliance.
+
+Key capabilities:
+- Allow SemVer build metadata ('+') in scripts/version.sh
+- Sanitize '+' to '-' for Docker tags in justfile release-image recipe
+- Keep apps/web/package.json version in sync with Cargo.toml
+- Document build metadata conventions in .ai/lessons.md
+---
+ .ai/lessons.md     | 1 +
+ justfile           | 2 +-
+ scripts/version.sh | 8 +++++---
+ 3 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/.ai/lessons.md b/.ai/lessons.md
+index 122480c..d8bb416 100644
+--- a/.ai/lessons.md
++++ b/.ai/lessons.md
+@@ -77,6 +77,7 @@
+ - Under bun + happy-dom, a failing `toBeNull()` on an element or a failing `waitFor` on a full page can exhaust a 4 GB memory cap with no output. Assert negatives by count and keep rendered page tests focused.
+ - happy-dom has no layout, so a TanStack Virtual list mounts no rows in tests. Put `data-virtual-scroller` on the scroll element: `src/test/dom.ts` gives it a height (and each `data-index` line 1px). Positions in such tests are line indexes in px.
+ - Tailwind v4 emits variant rules in its own order, not class order: two `data-[…]:` variants that set the same property (e.g. `top`) at equal specificity can resolve the wrong way. Make such variants mutually exclusive instead of relying on override order.
++- SemVer build metadata (`+`) in version strings (e.g. `0.2.1+1`): Cargo, npm/Bun, Git tags, and GitHub releases support `+`. Docker image tags strictly reject `+` (OCI reference grammar forbids it); sanitize `+` to `-` in Docker tag scripts.
+ 
+ ## HTML5 drag and drop: never unmount the drag source on dragstart
+ - Symptom: kanban cards went invisible while dragging and no drop indicator appeared.
+diff --git a/justfile b/justfile
+index 6f02ad0..e5ab673 100644
+--- a/justfile
++++ b/justfile
+@@ -144,6 +144,6 @@ build:
+ version *new:
+     bash scripts/version.sh {{ new }}
+ 
+-release-image tag=("orbit:" + `bash scripts/version.sh`):
++release-image tag=("orbit:" + `bash scripts/version.sh | tr '+' '-'`):
+     docker build --build-arg ORBIT_BUILD_REVISION="$(git rev-parse HEAD)" -t "{{ tag }}" .
+     docker run --rm "{{ tag }}" --help
+diff --git a/scripts/version.sh b/scripts/version.sh
+index bcf091a..9ff5101 100755
+--- a/scripts/version.sh
++++ b/scripts/version.sh
+@@ -3,6 +3,7 @@
+ # With an argument (for example `0.2.0`), sets that version and updates Cargo.lock.
+ set -euo pipefail
+ cd "$(dirname "$0")/.."
++export PATH="$HOME/.cargo/bin:$PATH"
+ 
+ current() {
+   awk '/^\[/{section=$0} section=="[workspace.package]" && /^version *=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml
+@@ -16,11 +17,12 @@ if [ $# -eq 0 ]; then
+ fi
+ 
+ new=$1
+-if ! [[ $new =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+-  echo "'$new' is not a version such as 1.2.3 or 1.2.3-rc.1" >&2
++if ! [[ $new =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
++  echo "'$new' is not a version such as 1.2.3, 1.2.3-rc.1, or 1.2.3+1" >&2
+   exit 1
+ fi
+ awk -v new="$new" '/^\[/{section=$0} section=="[workspace.package]" && /^version *=/{$0="version = \"" new "\""} {print}' Cargo.toml > Cargo.toml.tmp
+ mv Cargo.toml.tmp Cargo.toml
+ cargo update --workspace --offline --quiet
+-echo "Orbit version: $(current). Commit Cargo.toml and Cargo.lock, then publish the GitHub release with tag v$new."
++bun -e "const fs = require('fs'); const p = JSON.parse(fs.readFileSync('./apps/web/package.json', 'utf8')); p.version = process.argv[1]; fs.writeFileSync('./apps/web/package.json', JSON.stringify(p, null, 2) + '\n');" "$new"
++echo "Orbit version: $(current). Commit Cargo.toml, Cargo.lock, and apps/web/package.json, then publish the GitHub release with tag v$new."
+-- 
+2.56.0.windows.4
+

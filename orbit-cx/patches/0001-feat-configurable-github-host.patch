@@ -1,0 +1,3504 @@
+From 5ed227d2c47b7649e4cd21622b1db70789854c08 Mon Sep 17 00:00:00 2001
+From: Torben Haack <t128n@ipv4.8shield.net>
+Date: Sun, 8 Nov 2026 16:20:18 +0100
+Subject: [PATCH] feat: support configurable github enterprise hosts
+
+Add support for configurable GitHub Enterprise Server and GitHub Enterprise Cloud
+(ghe.com) hosts alongside github.com.
+
+Key capabilities:
+- Support custom GITHUB_HOST / ORBIT_GITHUB_URL for self-hosted instances
+- Add database migrations (0078_github_host.sql for SQLite and Postgres)
+- Wire host-aware bindings into GitHub authentication and integration routes
+- Add database host-binding checks to prevent cross-host split-brain states
+- Add unit and integration tests covering legacy handoff upgrades and non-locking checks
+---
+ apps/server/migrations/0078_github_host.sql   |   4 +
+ .../migrations/postgres/0078_github_host.sql  |   4 +
+ apps/server/src/app.rs                        |  35 +-
+ apps/server/src/auth_routes.rs                |  18 +-
+ apps/server/src/auth_routes/providers.rs      |  28 +-
+ apps/server/src/auth_routes/two_factor.rs     | 203 +++++++++++-
+ apps/server/src/github_binding.rs             | 305 ++++++++++++++++++
+ apps/server/src/integration_routes.rs         | 100 +++++-
+ apps/server/src/lib.rs                        |   5 +-
+ apps/server/src/link_preview.rs               |   8 +-
+ apps/server/src/notion/convert/mod.rs         |   8 +-
+ .../src/repositories/sign_in_providers.rs     |  36 +++
+ apps/server/src/repositories/tasks.rs         |  50 ++-
+ apps/server/src/repositories/two_factor.rs    |  22 +-
+ apps/server/src/router.rs                     |   5 +-
+ apps/server/src/sign_in_providers.rs          |  41 +++
+ apps/server/src/task_routes.rs                |  64 +++-
+ apps/server/src/windows_service.rs            |   6 +-
+ apps/server/src/workspace_routes.rs           |  11 +
+ apps/server/tests/app_smoke.rs                |   2 +-
+ apps/server/tests/github_upgrade_handoff.rs   | 176 ++++++++++
+ apps/server/tests/integrations_api.rs         |  66 ++++
+ apps/server/tests/sign_in_providers_api.rs    | 215 ++++++++++++
+ apps/server/tests/storage_api.rs              |   6 +-
+ apps/server/tests/tasks_api.rs                | 117 +++++++
+ apps/server/tests/two_factor_api.rs           |   3 +
+ crates/platform/src/backup.rs                 |   2 +-
+ crates/platform/src/config.rs                 |  28 ++
+ crates/platform/src/db/migrate.rs             |  10 +
+ crates/platform/src/github.rs                 | 269 +++++++++++++++
+ crates/platform/src/http/mod.rs               |  33 +-
+ crates/platform/src/http/security.rs          |  11 +-
+ crates/platform/src/lib.rs                    |   2 +
+ crates/platform/tests/backup.rs               |   4 +-
+ crates/platform/tests/database.rs             |   5 +-
+ crates/platform/tests/files.rs                |  54 ++--
+ crates/platform/tests/http_security.rs        |  56 +++-
+ deploy/.env.example                           |   2 +
+ deploy/README.md                              |   2 +
+ deploy/compose.yaml                           |   1 +
+ docs/github.md                                |  20 +-
+ docs/operations.md                            |   5 +-
+ 42 files changed, 1914 insertions(+), 128 deletions(-)
+ create mode 100644 apps/server/migrations/0078_github_host.sql
+ create mode 100644 apps/server/migrations/postgres/0078_github_host.sql
+ create mode 100644 apps/server/src/github_binding.rs
+ create mode 100644 apps/server/tests/github_upgrade_handoff.rs
+ create mode 100644 crates/platform/src/github.rs
+
+diff --git a/apps/server/migrations/0078_github_host.sql b/apps/server/migrations/0078_github_host.sql
+new file mode 100644
+index 0000000..9274a42
+--- /dev/null
++++ b/apps/server/migrations/0078_github_host.sql
+@@ -0,0 +1,4 @@
++CREATE TABLE github_host_binding (
++    singleton BIGINT PRIMARY KEY CHECK (singleton = 1),
++    origin TEXT NOT NULL
++);
+diff --git a/apps/server/migrations/postgres/0078_github_host.sql b/apps/server/migrations/postgres/0078_github_host.sql
+new file mode 100644
+index 0000000..9274a42
+--- /dev/null
++++ b/apps/server/migrations/postgres/0078_github_host.sql
+@@ -0,0 +1,4 @@
++CREATE TABLE github_host_binding (
++    singleton BIGINT PRIMARY KEY CHECK (singleton = 1),
++    origin TEXT NOT NULL
++);
+diff --git a/apps/server/src/app.rs b/apps/server/src/app.rs
+index 255035a..acc68b8 100644
+--- a/apps/server/src/app.rs
++++ b/apps/server/src/app.rs
+@@ -172,6 +172,10 @@ impl App {
+             .await
+             .map_err(|error| AppError::Migration(error.to_string()))?;
+ 
++        crate::github_binding::bind(&database, &config.github)
++            .await
++            .map_err(|error| AppError::Config(error.to_string()))?;
++
+         let integrity = IntegrityService::new(database.clone());
+         integrity
+             .quick()
+@@ -191,6 +195,7 @@ impl App {
+         }
+ 
+         TaskRepository::new(database.clone())
++            .with_github_host(config.github.clone())
+             .reconcile_github_attribution(orbit_platform::TimestampMillis::now())
+             .await
+             .map_err(|error| AppError::Database(error.to_string()))?;
+@@ -381,11 +386,15 @@ impl App {
+         );
+         let router = metrics.instrument(production_router(
+             ApiRoutes {
++                github_host: config.github.clone(),
+                 billing: billing.clone(),
+                 mcp: crate::mcp::router(
+                     crate::mcp::McpState::new(
+                         Arc::new(ApiTokenRepository::new(database.clone())),
+-                        Arc::new(TaskRepository::new(database.clone())),
++                        Arc::new(
++                            TaskRepository::new(database.clone())
++                                .with_github_host(config.github.clone()),
++                        ),
+                     )
+                     .with_content(
+                         Arc::new(crate::repositories::pages::PageRepository::new(
+@@ -402,7 +411,10 @@ impl App {
+                 public_api: crate::public_api::router(
+                     crate::public_api::PublicApiState::new(
+                         Arc::new(ApiTokenRepository::new(database.clone())),
+-                        Arc::new(TaskRepository::new(database.clone())),
++                        Arc::new(
++                            TaskRepository::new(database.clone())
++                                .with_github_host(config.github.clone()),
++                        ),
+                         &config.http.public_origin,
+                     )
+                     .with_pages(Arc::new(
+@@ -412,6 +424,7 @@ impl App {
+                 oauth: crate::oauth::router(oauth),
+                 auth: {
+                     let auth = auth
++                        .with_github_host(config.github.clone())
+                         .with_mailer(mailer.clone())
+                         .with_rate_limits(config.rate_limits)
+                         .with_uploads(attachment_state.uploads.clone())
+@@ -429,6 +442,7 @@ impl App {
+                     cookie_mode,
+                     backups.clone(),
+                 )
++                .with_github_host(config.github.clone())
+                 .with_mailer(mailer)
+                 .with_rate_limits(config.rate_limits)
+                 .with_object_storage(object_storage.clone(), blob_store.clone())
+@@ -445,8 +459,15 @@ impl App {
+                     attachment_state.uploads.clone(),
+                     cookie_mode,
+                 ),
+-                tasks: TaskState::new(Arc::clone(&identity), cookie_mode)
+-                    .with_socket_tickets(app_key.as_ref().map(SocketTickets::new)),
++                tasks: TaskState::with_repository(
++                    Arc::clone(&identity),
++                    Arc::new(
++                        TaskRepository::new(database.clone())
++                            .with_github_host(config.github.clone()),
++                    ),
++                    cookie_mode,
++                )
++                .with_socket_tickets(app_key.as_ref().map(SocketTickets::new)),
+                 pages: PageState::new(Arc::clone(&identity), cookie_mode)
+                     .with_socket_tickets(app_key.as_ref().map(SocketTickets::new)),
+                 page_comments: PageCommentState::new(Arc::clone(&identity), cookie_mode),
+@@ -470,8 +491,12 @@ impl App {
+                 attachments: attachment_state.clone(),
+                 integrations: IntegrationState::new(
+                     Arc::new(ApiTokenRepository::new(database.clone())),
+-                    Arc::new(TaskRepository::new(database.clone())),
++                    Arc::new(
++                        TaskRepository::new(database.clone())
++                            .with_github_host(config.github.clone()),
++                    ),
+                 )
++                .with_github_host(config.github.clone())
+                 .with_github_settings(
+                     Arc::clone(&identity),
+                     cookie_mode,
+diff --git a/apps/server/src/auth_routes.rs b/apps/server/src/auth_routes.rs
+index bca47c9..08b0583 100644
+--- a/apps/server/src/auth_routes.rs
++++ b/apps/server/src/auth_routes.rs
+@@ -186,11 +186,23 @@ pub struct AuthState {
+     public_origin: Arc<str>,
+     /// Google and GitHub over HTTP.
+     providers: crate::sign_in_providers::ProviderClient,
++    github_host: orbit_platform::GitHubHost,
+     /// Where a native provider sign-in may return to.
+     native_redirects: Arc<crate::sign_in_providers::NativeRedirects>,
+ }
+ 
+ impl AuthState {
++    /// Configure the GitHub OAuth host and its persistent identity binding.
++    #[must_use]
++    pub fn with_github_host(mut self, host: orbit_platform::GitHubHost) -> Self {
++        self.providers = self.providers.with_github_host(&host);
++        self.pending = Arc::new(two_factor::PendingStore::new(
++            self.database().clone(),
++            host.clone(),
++        ));
++        self.github_host = host;
++        self
++    }
+     #[must_use]
+     pub fn with_mailer(mut self, mailer: Mailer) -> Self {
+         self.mailer = Some(mailer);
+@@ -286,7 +298,10 @@ impl AuthState {
+         let dummy_hash = passwords
+             .hash("not a real account password")
+             .expect("the static dummy password satisfies policy");
+-        let pending = Arc::new(two_factor::PendingStore::new(repository.database().clone()));
++        let pending = Arc::new(two_factor::PendingStore::new(
++            repository.database().clone(),
++            orbit_platform::GitHubHost::default(),
++        ));
+         let throttler = Arc::new(throttle::SharedThrottler::new(
+             "login",
+             repository.database().clone(),
+@@ -307,6 +322,7 @@ impl AuthState {
+             billing_enabled: false,
+             public_origin: Arc::from(""),
+             providers: crate::sign_in_providers::ProviderClient::default(),
++            github_host: orbit_platform::GitHubHost::default(),
+             native_redirects: Arc::default(),
+         }
+     }
+diff --git a/apps/server/src/auth_routes/providers.rs b/apps/server/src/auth_routes/providers.rs
+index 12d77b7..0618bbd 100644
+--- a/apps/server/src/auth_routes/providers.rs
++++ b/apps/server/src/auth_routes/providers.rs
+@@ -64,7 +64,7 @@ pub(super) enum ProviderRedirect {
+ /// A provider flow from start to exchange.
+ #[derive(Clone, Serialize, Deserialize)]
+ pub(super) struct ProviderFlow {
+-    provider: Provider,
++    pub(super) provider: Provider,
+     intent: ProviderIntent,
+     /// S256 of the verifier the starting client keeps; the exchange must bring the verifier.
+     client_challenge: String,
+@@ -194,6 +194,11 @@ pub(super) async fn start_provider_sign_in(
+ ) -> Result<Json<StartProviderResponse>, ApiError> {
+     let rid = request_id.as_ref();
+     let provider = Provider::parse(&provider).ok_or_else(|| not_configured(START, rid))?;
++    if provider == Provider::Github {
++        crate::github_binding::check(state.database(), &state.github_host)
++            .await
++            .map_err(|_| ApiError::internal(START, rid))?;
++    }
+     let credentials = credentials(&state, provider)
+         .await
+         .map_err(|_| ApiError::internal(START, rid))?
+@@ -349,6 +354,13 @@ pub(super) async fn provider_callback(
+     if Provider::parse(&provider) != Some(flow.provider) {
+         return expired();
+     }
++    if flow.provider == Provider::Github
++        && crate::github_binding::check(state.database(), &state.github_host)
++            .await
++            .is_err()
++    {
++        return expired();
++    }
+     let outcome = match (query.error, query.code) {
+         (None, Some(code)) => match credentials(&state, flow.provider).await {
+             Ok(Some(credentials)) => {
+@@ -546,6 +558,9 @@ pub(super) async fn exchange_provider_sign_in(
+             ));
+         }
+     };
++    if profile.provider != provider {
++        return Err(invalid_handoff(rid));
++    }
+     match flow.intent {
+         ProviderIntent::SignIn => sign_in(&state, &headers, profile, rid).await,
+         ProviderIntent::Connect {
+@@ -558,6 +573,7 @@ pub(super) async fn exchange_provider_sign_in(
+                 .connect_identity(
+                     user_id,
+                     &profile,
++                    &state.github_host,
+                     request_id_value(rid),
+                     TimestampMillis::now(),
+                 )
+@@ -576,6 +592,7 @@ pub(super) async fn exchange_provider_sign_in(
+                     session_id,
+                     user_id,
+                     &profile,
++                    &state.github_host,
+                     request_id_value(rid),
+                     TimestampMillis::now(),
+                 )
+@@ -599,7 +616,12 @@ async fn sign_in(
+     };
+     let account = match state
+         .repository
+-        .provider_account(&profile, request_id_value(rid), TimestampMillis::now())
++        .provider_account(
++            &profile,
++            &state.github_host,
++            request_id_value(rid),
++            TimestampMillis::now(),
++        )
+         .await
+     {
+         Ok(account) => account,
+@@ -643,6 +665,7 @@ async fn finish_sign_in(
+         .create_provider_session_audited(
+             &user,
+             &profile,
++            &state.github_host,
+             link,
+             request_id_value(rid),
+             TimestampMillis::now(),
+@@ -958,6 +981,7 @@ pub(super) async fn disconnect_connected_account(
+         .disconnect_identity(
+             session.user.id,
+             provider,
++            &state.github_host,
+             request_id_value(rid),
+             TimestampMillis::now(),
+         )
+diff --git a/apps/server/src/auth_routes/two_factor.rs b/apps/server/src/auth_routes/two_factor.rs
+index 75fb73b..b399259 100644
+--- a/apps/server/src/auth_routes/two_factor.rs
++++ b/apps/server/src/auth_routes/two_factor.rs
+@@ -28,7 +28,7 @@ use crate::repositories::identity::{AuthenticatedSession, IdentityError};
+ use crate::repositories::sign_in_providers::ProviderSignInError;
+ use crate::repositories::two_factor::{RecoveryCodeKey, TwoFactorStatus};
+ use crate::secret_box::{decrypt_secret, encrypt_secret};
+-use crate::sign_in_providers::{ProviderFailure, ProviderProfile};
++use crate::sign_in_providers::{Provider, ProviderFailure, ProviderProfile};
+ 
+ /// How long a sign-in waits for its second factor, and a passkey ceremony for the browser.
+ const PENDING_LIFETIME_MILLIS: i64 = 5 * 60 * 1_000;
+@@ -94,6 +94,21 @@ pub(super) enum FirstFactor {
+ }
+ 
+ impl Pending {
++    fn uses_github(&self) -> bool {
++        match self {
++            Self::ProviderAuthorization { flow, .. } => flow.provider == Provider::Github,
++            Self::ProviderHandoff { flow, outcome } => {
++                flow.provider == Provider::Github
++                    || matches!(outcome, Ok(profile) if profile.provider == Provider::Github)
++            }
++            Self::ProviderLink { profile, .. } => profile.provider == Provider::Github,
++            Self::Login {
++                first_factor: FirstFactor::Provider { profile, .. },
++                ..
++            } => profile.provider == Provider::Github,
++            _ => false,
++        }
++    }
+     /// The serde tag, which [`encode`] writes first in the payload.
+     fn kind(&self) -> &'static str {
+         match self {
+@@ -107,6 +122,13 @@ impl Pending {
+     }
+ }
+ 
++/// Unknown or malformed persisted envelopes must not be assumed independent of GitHub.
++pub(crate) fn pending_may_use_github(payload: &str) -> bool {
++    serde_json::from_str::<Pending>(payload)
++        .map(|pending| pending.uses_github())
++        .unwrap_or(true)
++}
++
+ /// A `LIKE` pattern for the stored payloads of one kind.
+ fn kind_pattern(kind: &str) -> String {
+     format!("{{\"kind\":\"{kind}\"%")
+@@ -114,6 +136,7 @@ fn kind_pattern(kind: &str) -> String {
+ 
+ pub(super) struct PendingStore {
+     database: Database,
++    github_host: orbit_platform::GitHubHost,
+ }
+ 
+ fn token_hash(token: &str) -> String {
+@@ -125,8 +148,24 @@ fn encode(pending: &Pending) -> Result<String, sqlx::Error> {
+ }
+ 
+ impl PendingStore {
+-    pub(super) fn new(database: Database) -> Self {
+-        Self { database }
++    pub(super) fn new(database: Database, github_host: orbit_platform::GitHubHost) -> Self {
++        Self {
++            database,
++            github_host,
++        }
++    }
++
++    async fn check_binding(
++        &self,
++        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
++        pending: &Pending,
++    ) -> Result<(), sqlx::Error> {
++        if pending.uses_github() {
++            crate::github_binding::check_in_transaction(transaction, &self.github_host)
++                .await
++                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
++        }
++        Ok(())
+     }
+ 
+     /// Keeps `pending` under a new random token for five minutes. `None` when the store is full.
+@@ -143,6 +182,7 @@ impl PendingStore {
+         let payload = encode(&pending)?;
+         let now = TimestampMillis::now();
+         let mut transaction = self.database.immediate_transaction().await?;
++        self.check_binding(&mut transaction, &pending).await?;
+         sqlx::query("DELETE FROM auth_pending WHERE expires_at <= $1")
+             .bind(now.as_millis())
+             .execute(&mut *transaction)
+@@ -181,18 +221,25 @@ impl PendingStore {
+         .bind(token_hash(token))
+         .fetch_optional(&mut *transaction)
+         .await?;
+-        transaction.commit().await?;
+         let Some(row) = row else {
++            transaction.commit().await?;
+             return Ok(None);
+         };
+         let expires_at = TimestampMillis::from_millis(row.get("expires_at"));
+         if expires_at <= TimestampMillis::now() {
++            transaction.commit().await?;
+             return Ok(None);
+         }
++        let payload: String = row.get("payload_json");
++        let pending = serde_json::from_str::<Pending>(&payload).ok();
++        if pending_may_use_github(&payload) {
++            crate::github_binding::check_in_transaction(&mut transaction, &self.github_host)
++                .await
++                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
++        }
++        transaction.commit().await?;
+         // An entry an older version wrote in another shape is as good as expired.
+-        Ok(serde_json::from_str(&row.get::<String, _>("payload_json"))
+-            .ok()
+-            .map(|pending| (expires_at, pending)))
++        Ok(pending.map(|pending| (expires_at, pending)))
+     }
+ 
+     /// Puts an entry back under its token with its first expiry, for another try.
+@@ -204,6 +251,7 @@ impl PendingStore {
+     ) -> Result<(), sqlx::Error> {
+         let payload = encode(&pending)?;
+         let mut transaction = self.database.immediate_transaction().await?;
++        self.check_binding(&mut transaction, &pending).await?;
+         sqlx::query(
+             "INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3) \
+              ON CONFLICT (token_hash) DO NOTHING",
+@@ -338,6 +386,7 @@ pub(super) async fn login_second_factor(
+         &state,
+         &user,
+         &body.code,
++        matches!(&first_factor, FirstFactor::Provider { profile, .. } if profile.provider == Provider::Github),
+         request_id_value(request_id.as_ref()),
+     )
+     .await
+@@ -409,7 +458,14 @@ pub(super) async fn login_second_factor(
+             })?,
+         FirstFactor::Provider { profile, link } => state
+             .repository
+-            .create_provider_session_audited(&user, profile, *link, rid, TimestampMillis::now())
++            .create_provider_session_audited(
++                &user,
++                profile,
++                &state.github_host,
++                *link,
++                rid,
++                TimestampMillis::now(),
++            )
+             .await
+             .map_err(|error| match error {
+                 ProviderSignInError::Refused(_) => expired(),
+@@ -432,6 +488,7 @@ async fn check_code(
+     state: &AuthState,
+     user: &AuthenticatedUser,
+     code: &str,
++    github: bool,
+     request_id: &str,
+ ) -> Result<bool, IdentityError> {
+     let code = code.trim().replace(' ', "");
+@@ -439,7 +496,10 @@ async fn check_code(
+         let Some(step) = totp_step(state, user, &code).await? else {
+             return Ok(false);
+         };
+-        return state.repository.use_totp_step(user.id, step).await;
++        return state
++            .repository
++            .use_totp_step(user.id, step, github.then_some(&state.github_host))
++            .await;
+     }
+     let Some(codes_key) = recovery_code_key(state) else {
+         return Ok(false);
+@@ -450,6 +510,7 @@ async fn check_code(
+             user.id,
+             &code,
+             &codes_key,
++            github.then_some(&state.github_host),
+             request_id,
+             TimestampMillis::now(),
+         )
+@@ -834,3 +895,127 @@ pub(super) async fn confirm_identity(
+         request_id,
+     ))
+ }
++
++#[cfg(test)]
++mod binding_tests {
++    use super::*;
++    use orbit_platform::{GitHubHost, TestDatabase};
++
++    #[tokio::test]
++    async fn orphaned_serialized_github_pending_refuses_enterprise_and_preserves_token() {
++        for payload in [
++            r#"{"kind":"provider_handoff","flow":{"provider":"github","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Ok":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"}}}"#,
++            r#"{"kind":"provider_handoff","flow":{"provider":"google","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Ok":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"}}}"#,
++            r#"{"kind":"login","user":{"id":"01890f47-0000-7000-8000-000000000001","email":"a@example.test","display_name":"A"},"first_factor":{"kind":"provider","profile":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"},"link":true},"attempts":0}"#,
++        ] {
++            let db = TestDatabase::new().await.unwrap();
++            let default = GitHubHost::default();
++            let enterprise: GitHubHost = "https://enterprise.example".parse().unwrap();
++            crate::github_binding::bind(&db, &default).await.unwrap();
++            sqlx::query("INSERT INTO sign_in_providers (provider, client_id, client_secret, created_at, updated_at) VALUES ('github', 'id', $1, 0, 0)")
++                .bind(vec![1_u8]).execute(db.pool()).await.unwrap();
++            let store = PendingStore::new((*db).clone(), default.clone());
++            let pending: Pending = serde_json::from_str(payload).unwrap();
++            let token = store.insert(pending).await.unwrap().unwrap();
++            // Simulate a pre-upgrade database with the provider removed but its pending token left.
++            sqlx::query("DELETE FROM sign_in_providers WHERE provider = 'github'")
++                .execute(db.pool())
++                .await
++                .unwrap();
++            sqlx::query("DELETE FROM github_host_binding")
++                .execute(db.pool())
++                .await
++                .unwrap();
++            assert!(matches!(
++                crate::github_binding::bind(&db, &enterprise).await,
++                Err(crate::github_binding::GitHubBindingError::Mismatch { .. })
++            ));
++            let wrong_store = PendingStore::new((*db).clone(), enterprise);
++            assert!(wrong_store.take(&token).await.is_err());
++            assert!(store.take(&token).await.unwrap().is_some());
++            assert!(store.take(&token).await.unwrap().is_none());
++        }
++    }
++
++    #[tokio::test]
++    async fn non_github_pending_works_with_another_binding() {
++        let db = TestDatabase::new().await.unwrap();
++        crate::github_binding::bind(&db, &GitHubHost::default())
++            .await
++            .unwrap();
++        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
++        let store = PendingStore::new((*db).clone(), host);
++        for payload in [
++            r#"{"kind":"provider_handoff","flow":{"provider":"google","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Ok":{"provider":"google","subject":"123","verified_email":null,"email":null,"display_name":"A"}}}"#,
++            r#"{"kind":"login","user":{"id":"01890f47-0000-7000-8000-000000000001","email":"a@example.test","display_name":"A"},"first_factor":{"kind":"password","password_hash":"hash","replacement_hash":null},"attempts":0}"#,
++        ] {
++            let token = store
++                .insert(serde_json::from_str(payload).unwrap())
++                .await
++                .unwrap()
++                .unwrap();
++            assert!(store.take(&token).await.unwrap().is_some());
++        }
++    }
++
++    #[tokio::test]
++    async fn malformed_pending_is_not_consumed_with_wrong_binding() {
++        let db = TestDatabase::new().await.unwrap();
++        crate::github_binding::bind(&db, &GitHubHost::default())
++            .await
++            .unwrap();
++        let token = "malformed-token";
++        sqlx::query(
++            "INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3)",
++        )
++        .bind(token_hash(token))
++        .bind(TimestampMillis::now().as_millis() + 60_000)
++        .bind(r#"{"kind":"provider_handoff","flow":{"provider":"google"}}"#)
++        .execute(db.pool())
++        .await
++        .unwrap();
++        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
++        assert!(
++            PendingStore::new((*db).clone(), host)
++                .take(token)
++                .await
++                .is_err()
++        );
++        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_pending")
++            .fetch_one(db.pool())
++            .await
++            .unwrap();
++        assert_eq!(count, 1);
++    }
++
++    #[tokio::test]
++    async fn expired_pending_is_removed_even_with_wrong_binding() {
++        let db = TestDatabase::new().await.unwrap();
++        crate::github_binding::bind(&db, &GitHubHost::default())
++            .await
++            .unwrap();
++        let token = "expired-token";
++        sqlx::query(
++            "INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3)",
++        )
++        .bind(token_hash(token))
++        .bind(TimestampMillis::now().as_millis() - 1)
++        .bind("invalid")
++        .execute(db.pool())
++        .await
++        .unwrap();
++        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
++        assert!(
++            PendingStore::new((*db).clone(), host)
++                .take(token)
++                .await
++                .unwrap()
++                .is_none()
++        );
++        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_pending")
++            .fetch_one(db.pool())
++            .await
++            .unwrap();
++        assert_eq!(count, 0);
++    }
++}
+diff --git a/apps/server/src/github_binding.rs b/apps/server/src/github_binding.rs
+new file mode 100644
+index 0000000..009c160
+--- /dev/null
++++ b/apps/server/src/github_binding.rs
+@@ -0,0 +1,305 @@
++//! Persistent GitHub host identity for this database.
++use crate::auth_routes::two_factor::pending_may_use_github;
++use orbit_platform::{Database, GitHubHost};
++use sqlx::{Any, Transaction};
++use thiserror::Error;
++
++#[derive(Debug, Error)]
++pub enum GitHubBindingError {
++    #[error(
++        "changing hosts with existing GitHub data is not supported in this release: database is bound to {bound}, configured host is {configured}"
++    )]
++    Mismatch { bound: String, configured: String },
++    #[error("GitHub host binding is missing")]
++    Missing,
++    #[error("GitHub host binding database error: {0}")]
++    Database(#[from] sqlx::Error),
++}
++
++/// Bind on first startup. Legacy GitHub records belong to the default host.
++pub async fn bind(database: &Database, host: &GitHubHost) -> Result<(), GitHubBindingError> {
++    let mut tx = database.immediate_transaction().await?;
++    let existing: Option<String> =
++        sqlx::query_scalar("SELECT origin FROM github_host_binding WHERE singleton = 1")
++            .fetch_optional(&mut *tx)
++            .await?;
++    if existing.is_none() {
++        let legacy: i64 = sqlx::query_scalar("SELECT CAST(CASE WHEN EXISTS (SELECT 1 FROM github_apps) OR EXISTS (SELECT 1 FROM github_app_registrations) OR EXISTS (SELECT 1 FROM github_installations) OR EXISTS (SELECT 1 FROM github_installation_repositories) OR EXISTS (SELECT 1 FROM github_project_connections) OR EXISTS (SELECT 1 FROM github_issue_links) OR EXISTS (SELECT 1 FROM github_pull_links) OR EXISTS (SELECT 1 FROM sign_in_providers WHERE provider = 'github') OR EXISTS (SELECT 1 FROM user_identities WHERE provider = 'github') THEN 1 ELSE 0 END AS BIGINT)")
++            .fetch_one(&mut *tx).await?;
++        let pending_github = if legacy == 0 {
++            let payloads: Vec<String> =
++                sqlx::query_scalar("SELECT payload_json FROM auth_pending WHERE expires_at > $1")
++                    .bind(orbit_platform::TimestampMillis::now().as_millis())
++                    .fetch_all(&mut *tx)
++                    .await?;
++            payloads
++                .iter()
++                .any(|payload| pending_may_use_github(payload))
++        } else {
++            false
++        };
++        let origin = if legacy != 0 || pending_github {
++            GitHubHost::default()
++        } else {
++            host.clone()
++        };
++        sqlx::query("INSERT INTO github_host_binding (singleton, origin) VALUES (1, $1)")
++            .bind(origin.web_origin())
++            .execute(&mut *tx)
++            .await?;
++        // Persist the legacy binding even when this startup must be refused.
++        tx.commit().await?;
++        return compare(origin.web_origin(), host);
++    }
++    compare(existing.as_deref().expect("checked above"), host)?;
++    tx.commit().await?;
++    Ok(())
++}
++
++fn compare(bound: &str, host: &GitHubHost) -> Result<(), GitHubBindingError> {
++    if bound == host.web_origin() {
++        Ok(())
++    } else {
++        Err(GitHubBindingError::Mismatch {
++            bound: bound.to_owned(),
++            configured: host.web_origin().to_owned(),
++        })
++    }
++}
++
++/// Check the persistent binding in an existing transaction. Use an immediate transaction for writes.
++pub async fn check_in_transaction(
++    tx: &mut Transaction<'_, Any>,
++    host: &GitHubHost,
++) -> Result<(), GitHubBindingError> {
++    let bound: Option<String> =
++        sqlx::query_scalar("SELECT origin FROM github_host_binding WHERE singleton = 1")
++            .fetch_optional(&mut **tx)
++            .await?;
++    compare(bound.as_deref().ok_or(GitHubBindingError::Missing)?, host)
++}
++
++/// Check the persistent binding without changing it.
++pub async fn check(database: &Database, host: &GitHubHost) -> Result<(), GitHubBindingError> {
++    let bound: Option<String> =
++        sqlx::query_scalar("SELECT origin FROM github_host_binding WHERE singleton = 1")
++            .fetch_optional(database.pool())
++            .await?;
++    compare(bound.as_deref().ok_or(GitHubBindingError::Missing)?, host)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use orbit_platform::TestDatabase;
++
++    #[test]
++    fn pending_classification_is_conservative() {
++        for payload in [
++            r#"{"kind":"provider_authorization","flow":{"provider":"google"}}"#,
++            r#"{"kind":"passkey_login"}"#,
++            r#"{"kind":"unknown"}"#,
++            "not json",
++        ] {
++            assert!(pending_may_use_github(payload), "{payload}");
++        }
++        for payload in [
++            r#"{"kind":"provider_authorization","flow":{"provider":"google","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"pkce_verifier":"verifier"}"#,
++            r#"{"kind":"provider_handoff","flow":{"provider":"google","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Err":"denied"}}"#,
++            r#"{"kind":"login","user":{"id":"01890f47-0000-7000-8000-000000000001","email":"a@example.test","display_name":"A"},"first_factor":{"kind":"password","password_hash":"hash","replacement_hash":null},"attempts":0}"#,
++        ] {
++            assert!(!pending_may_use_github(payload), "{payload}");
++        }
++    }
++
++    #[tokio::test]
++    async fn unexpired_pending_flows_preserve_legacy_host_binding() {
++        for (payload, unexpired, expected_github) in [
++            (
++                r#"{"kind":"provider_handoff","flow":{"provider":"github","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"outcome":{"Ok":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"}}}"#,
++                true,
++                true,
++            ),
++            (
++                r#"{"kind":"login","user":{"id":"01890f47-0000-7000-8000-000000000001","email":"a@example.test","display_name":"A"},"first_factor":{"kind":"provider","profile":{"provider":"github","subject":"123","verified_email":null,"email":null,"display_name":"A"},"link":true},"attempts":0}"#,
++                true,
++                true,
++            ),
++            (
++                r#"{"kind":"provider_authorization","flow":{"provider":"google","intent":{"kind":"sign_in"},"client_challenge":"challenge","redirect":{"kind":"web"},"return_to":null},"pkce_verifier":"verifier"}"#,
++                true,
++                false,
++            ),
++            (
++                r#"{"kind":"provider_handoff","flow":{"provider":"github"}}"#,
++                false,
++                false,
++            ),
++            ("invalid", true, true),
++        ] {
++            let db = TestDatabase::new().await.unwrap();
++            let now = orbit_platform::TimestampMillis::now().as_millis();
++            sqlx::query("INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3)")
++                .bind("pending")
++                .bind(if unexpired { now + 60_000 } else { now - 1 })
++                .bind(payload)
++                .execute(db.pool()).await.unwrap();
++            let host: GitHubHost = "https://enterprise.example".parse().unwrap();
++            let result = bind(&db, &host).await;
++            if expected_github {
++                assert!(
++                    matches!(result, Err(GitHubBindingError::Mismatch { .. })),
++                    "{payload}"
++                );
++                check(&db, &GitHubHost::default()).await.unwrap();
++            } else {
++                result.unwrap();
++                check(&db, &host).await.unwrap();
++            }
++            let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_pending")
++                .fetch_one(db.pool())
++                .await
++                .unwrap();
++            assert_eq!(remaining, 1);
++        }
++    }
++
++    #[tokio::test]
++    async fn binding_is_persistent_and_serialized() {
++        let db = TestDatabase::new().await.unwrap();
++        let first: GitHubHost = "https://enterprise.example".parse().unwrap();
++        let second: GitHubHost = "https://other.example".parse().unwrap();
++        let (a, b) = tokio::join!(bind(&db, &first), bind(&db, &second));
++        assert_ne!(a.is_ok(), b.is_ok());
++        let winner = if a.is_ok() { &first } else { &second };
++        let loser = if a.is_ok() { &second } else { &first };
++        check(&db, winner).await.unwrap();
++        let error = check(&db, loser).await.unwrap_err().to_string();
++        assert!(error.contains(winner.web_origin()) && error.contains(loser.web_origin()));
++        assert!(
++            error.contains(
++                "changing hosts with existing GitHub data is not supported in this release"
++            )
++        );
++        let mut tx = db.immediate_transaction().await.unwrap();
++        check_in_transaction(&mut tx, winner).await.unwrap();
++        tx.commit().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn legacy_provider_binds_default_even_on_mismatch() {
++        let db = TestDatabase::new().await.unwrap();
++        sqlx::query("INSERT INTO sign_in_providers (provider, client_id, client_secret, created_at, updated_at) VALUES ('github', 'id', $1, 0, 0)")
++            .bind(vec![1_u8]).execute(db.pool()).await.unwrap();
++        let enterprise: GitHubHost = "https://enterprise.example".parse().unwrap();
++        assert!(matches!(
++            bind(&db, &enterprise).await,
++            Err(GitHubBindingError::Mismatch { .. })
++        ));
++        check(&db, &GitHubHost::default()).await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn missing_binding_and_same_host_concurrent_startup() {
++        let db = TestDatabase::new().await.unwrap();
++        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
++        assert!(matches!(
++            check(&db, &host).await,
++            Err(GitHubBindingError::Missing)
++        ));
++        let (a, b) = tokio::join!(bind(&db, &host), bind(&db, &host));
++        a.unwrap();
++        b.unwrap();
++        bind(&db, &host).await.unwrap();
++        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_host_binding")
++            .fetch_one(db.pool())
++            .await
++            .unwrap();
++        assert_eq!(count, 1);
++    }
++
++    #[tokio::test]
++    async fn non_github_identity_data_does_not_force_default() {
++        let db = TestDatabase::new().await.unwrap();
++        sqlx::query("INSERT INTO users (id, email, normalized_email, display_name, password_hash, created_at, updated_at) VALUES ('u', 'a@example.test', 'a@example.test', 'A', '', 0, 0)")
++            .execute(db.pool()).await.unwrap();
++        sqlx::query("INSERT INTO sign_in_providers (provider, client_id, client_secret, created_at, updated_at) VALUES ('google', 'id', $1, 0, 0)")
++            .bind(vec![1_u8]).execute(db.pool()).await.unwrap();
++        sqlx::query("INSERT INTO user_identities (provider, subject, user_id, created_at) VALUES ('google', 'subject', 'u', 0)")
++            .execute(db.pool()).await.unwrap();
++        let host: GitHubHost = "https://enterprise.example".parse().unwrap();
++        bind(&db, &host).await.unwrap();
++        check(&db, &host).await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn legacy_records_bind_default() {
++        // Each fixture uses a fresh database. Child installation rows require their GitHub app
++        // parent by foreign key; issue links, pull links, registrations and identities stand alone.
++        for source in [
++            "app",
++            "registration",
++            "installation",
++            "repository",
++            "connection",
++            "issue",
++            "pull",
++            "identity",
++        ] {
++            let db = TestDatabase::new().await.unwrap();
++            let mut tx = db.immediate_transaction().await.unwrap();
++            for statement in [
++                "INSERT INTO users (id, email, normalized_email, display_name, password_hash, created_at, updated_at) VALUES ('u', 'a@example.test', 'a@example.test', 'A', '', 0, 0)",
++                "INSERT INTO workspaces (id, name, owner_membership_id, created_at, updated_at) VALUES ('w', 'W', 'm', 0, 0)",
++                "INSERT INTO memberships (id, workspace_id, user_id, role, created_at, updated_at) VALUES ('m', 'w', 'u', 'owner', 0, 0)",
++                "INSERT INTO projects (id, workspace_id, name, project_key, color, created_at, updated_at) VALUES ('p', 'w', 'P', 'P', '#000000', 0, 0)",
++                "INSERT INTO task_statuses (id, workspace_id, project_id, name, description, color, category, position, created_at, updated_at) VALUES ('s', 'w', 'p', 'S', '', '#000000', 'unstarted', 0, 0, 0)",
++                "INSERT INTO tasks (id, workspace_id, project_id, status_id, title, creator_id, created_at, updated_at) VALUES ('t', 'w', 'p', 's', 'T', 'u', 0, 0)",
++            ] {
++                sqlx::query(statement).execute(&mut *tx).await.unwrap();
++            }
++            tx.commit().await.unwrap();
++            if matches!(source, "app" | "installation" | "repository" | "connection") {
++                sqlx::query("INSERT INTO github_apps (workspace_id, app_id, slug, private_key_encrypted, webhook_secret_encrypted, created_at) VALUES ('w', 1, 'app', $1, $2, 0)")
++                    .bind(vec![1_u8]).bind(vec![2_u8]).execute(db.pool()).await.unwrap();
++            }
++            if matches!(source, "installation" | "repository" | "connection") {
++                sqlx::query("INSERT INTO github_installations (installation_id, workspace_id, account_login) VALUES (1, 'w', 'account')")
++                    .execute(db.pool()).await.unwrap();
++            }
++            let statement = match source {
++                "registration" => {
++                    sqlx::query("INSERT INTO github_app_registrations (state_hash, workspace_id, expires_at, public_origin) VALUES ($1, 'w', 1, '')")
++                        .bind(vec![1_u8]).execute(db.pool()).await.unwrap();
++                    None
++                }
++                "repository" => Some(
++                    "INSERT INTO github_installation_repositories (installation_id, repository) VALUES (1, 'o/r')",
++                ),
++                "connection" => Some(
++                    "INSERT INTO github_project_connections (project_id, workspace_id, installation_id, repository, label) VALUES ('p', 'w', 1, 'o/r', 'label')",
++                ),
++                "issue" => Some(
++                    "INSERT INTO github_issue_links (workspace_id, repository, issue_number, task_id) VALUES ('w', 'o/r', 1, 't')",
++                ),
++                "pull" => Some(
++                    "INSERT INTO github_pull_links (workspace_id, repository, pull_number, task_id, title, url, state, updated_at) VALUES ('w', 'o/r', 1, 't', 'title', 'url', 'open', 0)",
++                ),
++                "identity" => Some(
++                    "INSERT INTO user_identities (provider, subject, user_id, created_at) VALUES ('github', 'subject', 'u', 0)",
++                ),
++                _ => None,
++            };
++            if let Some(statement) = statement {
++                sqlx::query(statement).execute(db.pool()).await.unwrap();
++            }
++            let enterprise: GitHubHost = "https://enterprise.example".parse().unwrap();
++            let error = bind(&db, &enterprise).await.unwrap_err();
++            assert!(
++                matches!(error, GitHubBindingError::Mismatch { .. }),
++                "{source}: {error}"
++            );
++            check(&db, &GitHubHost::default()).await.unwrap();
++        }
++    }
++}
+diff --git a/apps/server/src/integration_routes.rs b/apps/server/src/integration_routes.rs
+index 61b2408..a35d884 100644
+--- a/apps/server/src/integration_routes.rs
++++ b/apps/server/src/integration_routes.rs
+@@ -9,7 +9,9 @@ use axum::routing::{get, post};
+ use axum::{Json, Router};
+ use hmac::{Hmac, Mac};
+ use orbit_domain::Permission;
+-use orbit_platform::{Flag, Id, Problem, RequestId, Row, TimestampMillis, generate_opaque_token};
++use orbit_platform::{
++    Flag, GitHubHost, Id, Problem, RequestId, Row, TimestampMillis, generate_opaque_token,
++};
+ use serde::de::DeserializeOwned;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+@@ -67,6 +69,7 @@ pub struct IntegrationState {
+     tokens: Arc<ApiTokenRepository>,
+     tasks: Arc<TaskRepository>,
+     github_settings: Option<GithubSettings>,
++    github_host: GitHubHost,
+ }
+ 
+ #[derive(Clone)]
+@@ -86,6 +89,7 @@ impl IntegrationState {
+             tokens,
+             tasks,
+             github_settings: None,
++            github_host: GitHubHost::default(),
+         }
+     }
+ 
+@@ -104,10 +108,48 @@ impl IntegrationState {
+             public_origin,
+             allow_request_origin,
+             encryption_key,
+-            client: reqwest::Client::new(),
++            client: reqwest::Client::builder()
++                .redirect(reqwest::redirect::Policy::none())
++                .build()
++                .expect("valid GitHub HTTP client"),
+         });
+         self
+     }
++
++    #[must_use]
++    pub fn with_github_host(mut self, host: GitHubHost) -> Self {
++        self.github_host = host;
++        self
++    }
++}
++
++fn github_binding_error(id: Option<&RequestId>) -> ApiError {
++    ApiError::new(
++        StatusCode::SERVICE_UNAVAILABLE,
++        "github_host_mismatch",
++        "GitHub unavailable",
++        "The configured GitHub host does not match this database's binding.",
++        id,
++    )
++}
++
++async fn check_github_binding(
++    state: &IntegrationState,
++    id: Option<&RequestId>,
++) -> Result<(), ApiError> {
++    crate::github_binding::check(state.tasks.database(), &state.github_host)
++        .await
++        .map_err(|_| github_binding_error(id))
++}
++
++async fn check_github_binding_tx(
++    state: &IntegrationState,
++    tx: &mut Transaction<'_, Any>,
++    id: Option<&RequestId>,
++) -> Result<(), ApiError> {
++    crate::github_binding::check_in_transaction(tx, &state.github_host)
++        .await
++        .map_err(|_| github_binding_error(id))
+ }
+ 
+ pub fn integration_router(state: IntegrationState) -> Router {
+@@ -348,6 +390,7 @@ pub(crate) async fn github_workspace_settings(
+ ) -> Result<Json<GithubWorkspaceSettings>, ApiError> {
+     let id = request_id.as_ref().map(|Extension(id)| id);
+     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
++    check_github_binding(&state, id).await?;
+     let app: Option<String> =
+         sqlx::query_scalar("SELECT slug FROM github_apps WHERE workspace_id = $1")
+             .bind(&workspace)
+@@ -357,7 +400,7 @@ pub(crate) async fn github_workspace_settings(
+     Ok(Json(GithubWorkspaceSettings {
+         install_url: app
+             .as_ref()
+-            .map(|slug| format!("https://github.com/apps/{slug}/installations/new")),
++            .map(|slug| state.github_host.installation_url(slug)),
+         app_slug: app,
+         repositories: github_repositories(&state, &workspace, id).await?,
+         can_manage,
+@@ -378,6 +421,7 @@ pub(crate) async fn github_project_settings(
+     let request_id = request_id.as_ref().map(|Extension(id)| id);
+     let (_, _, can_manage) =
+         github_project_access(&state, &headers, &workspace, &project, request_id).await?;
++    check_github_binding(&state, request_id).await?;
+     let app: Option<String> =
+         sqlx::query_scalar("SELECT slug FROM github_apps WHERE workspace_id = $1")
+             .bind(&workspace)
+@@ -389,7 +433,7 @@ pub(crate) async fn github_project_settings(
+     Ok(Json(GithubProjectSettings {
+         install_url: app
+             .as_ref()
+-            .map(|slug| format!("https://github.com/apps/{slug}/installations/new")),
++            .map(|slug| state.github_host.installation_url(slug)),
+         app_slug: app,
+         repository: connection.as_ref().map(|row| row.get("repository")),
+         label: connection.as_ref().map(|row| row.get("label")),
+@@ -430,6 +474,7 @@ pub(crate) async fn save_github_project_connection(
+     let (_, _, can_manage) =
+         github_project_access(&state, &headers, &workspace, &project, id).await?;
+     require_github_manager(can_manage, id)?;
++    check_github_binding(&state, id).await?;
+     let label = body.label.trim();
+     if !valid_repository(&body.repository) || label.is_empty() || label.chars().count() > 50 {
+         return Err(ApiError::new(
+@@ -457,6 +502,7 @@ pub(crate) async fn save_github_project_connection(
+         .immediate_transaction()
+         .await
+         .map_err(|_| ApiError::internal(id))?;
++    check_github_binding_tx(&state, &mut tx, id).await?;
+     let changed = sqlx::query("INSERT INTO github_project_connections (workspace_id, project_id, installation_id, repository, label) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(project_id) DO UPDATE SET installation_id = excluded.installation_id, repository = excluded.repository, label = excluded.label WHERE github_project_connections.installation_id != excluded.installation_id OR github_project_connections.repository != excluded.repository OR github_project_connections.label != excluded.label")
+         .bind(&workspace).bind(&project).bind(body.installation_id).bind(&body.repository).bind(label).execute(&mut *tx).await;
+     match changed {
+@@ -496,12 +542,14 @@ pub(crate) async fn delete_github_project_connection(
+     let (_, _, can_manage) =
+         github_project_access(&state, &headers, &workspace, &project, id).await?;
+     require_github_manager(can_manage, id)?;
++    check_github_binding(&state, id).await?;
+     let mut tx = state
+         .tasks
+         .database()
+         .immediate_transaction()
+         .await
+         .map_err(|_| ApiError::internal(id))?;
++    check_github_binding_tx(&state, &mut tx, id).await?;
+     let removed = sqlx::query(
+         "DELETE FROM github_project_connections WHERE workspace_id = $1 AND project_id = $2",
+     )
+@@ -569,6 +617,7 @@ pub(crate) async fn start_github_manifest(
+     app_key(settings, id)?;
+     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
+     require_github_manager(can_manage, id)?;
++    check_github_binding(&state, id).await?;
+     let origin = github_registration_origin(settings, &headers, id)?;
+     let organization = body.organization.as_deref().unwrap_or("").trim();
+     if !organization.is_empty()
+@@ -604,22 +653,29 @@ pub(crate) async fn start_github_manifest(
+     }
+     let token = generate_opaque_token();
+     let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
++    let mut tx = state
++        .tasks
++        .database()
++        .immediate_transaction()
++        .await
++        .map_err(|_| ApiError::internal(id))?;
++    check_github_binding_tx(&state, &mut tx, id).await?;
+     sqlx::query("DELETE FROM github_app_registrations WHERE expires_at <= $1")
+         .bind(TimestampMillis::now().as_millis())
+-        .execute(state.tasks.database().pool())
++        .execute(&mut *tx)
+         .await
+         .map_err(|_| ApiError::internal(id))?;
+     sqlx::query("INSERT INTO github_app_registrations (state_hash, workspace_id, expires_at, public_origin) VALUES ($1, $2, $3, $4) ON CONFLICT(workspace_id) DO UPDATE SET state_hash = excluded.state_hash, expires_at = excluded.expires_at, public_origin = excluded.public_origin")
+          .bind(hash.to_vec()).bind(&workspace).bind(TimestampMillis::now().as_millis() + 3_600_000).bind(&origin)
+-        .execute(state.tasks.database().pool()).await.map_err(|_| ApiError::internal(id))?;
++        .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
++    tx.commit().await.map_err(|_| ApiError::internal(id))?;
+     Ok(Json(GithubManifestStart {
+-        action: if organization.is_empty() {
+-            format!("https://github.com/settings/apps/new?state={token}")
+-        } else {
+-            format!(
+-                "https://github.com/organizations/{organization}/settings/apps/new?state={token}"
+-            )
+-        },
++        action: format!(
++            "{}?state={token}",
++            state
++                .github_host
++                .manifest_url((!organization.is_empty()).then_some(organization))
++        ),
+         manifest: serde_json::json!({
+             "name": "Orbit",
+             "url": origin,
+@@ -659,6 +715,7 @@ pub(crate) async fn github_manifest_callback(
+     })?;
+     let settings = github_settings_context(&state, id)?;
+     let key = app_key(settings, id)?;
++    check_github_binding(&state, id).await?;
+     if query.state.len() > 200 || query.code.len() > 200 || query.code.is_empty() {
+         return Err(ApiError::new(
+             StatusCode::BAD_REQUEST,
+@@ -688,12 +745,16 @@ pub(crate) async fn github_manifest_callback(
+     })?;
+     let workspace: String = pending.get("workspace_id");
+     let registered_origin: String = pending.get("public_origin");
++    let mut conversion_url =
++        reqwest::Url::parse(&state.github_host.rest_base()).map_err(|_| ApiError::internal(id))?;
++    conversion_url
++        .path_segments_mut()
++        .map_err(|_| ApiError::internal(id))?
++        .pop_if_empty()
++        .extend(["app-manifests", query.code.as_str(), "conversions"]);
+     let response = settings
+         .client
+-        .post(format!(
+-            "https://api.github.com/app-manifests/{}/conversions",
+-            query.code
+-        ))
++        .post(conversion_url)
+         .header("User-Agent", "Orbit")
+         .header("Accept", "application/vnd.github+json")
+         .header("X-GitHub-Api-Version", "2022-11-28")
+@@ -758,6 +819,7 @@ async fn store_github_app(
+         .immediate_transaction()
+         .await
+         .map_err(|_| ApiError::internal(id))?;
++    check_github_binding_tx(state, &mut tx, id).await?;
+     let consumed = sqlx::query("DELETE FROM github_app_registrations WHERE state_hash = $1 AND workspace_id = $2 AND expires_at > $3")
+         .bind(hash.to_vec()).bind(workspace).bind(TimestampMillis::now().as_millis())
+         .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
+@@ -813,6 +875,7 @@ async fn github_webhook_from_database(
+ ) -> Result<StatusCode, ApiError> {
+     let request_id = request.extensions().get::<RequestId>().cloned();
+     let id = request_id.as_ref();
++    check_github_binding(state, id).await?;
+     if request
+         .headers()
+         .get("x-github-event")
+@@ -1017,6 +1080,7 @@ async fn github_webhook_from_database(
+                 .immediate_transaction()
+                 .await
+                 .map_err(|_| ApiError::internal(id))?;
++            check_github_binding_tx(state, &mut tx, id).await?;
+             let paused = sqlx::query("UPDATE github_issue_links SET sync_paused = 1 WHERE workspace_id = $1 AND repository = $2 AND issue_number = $3 AND kind = $4 AND sync_paused = 0")
+                 .bind(&workspace).bind(repository).bind(number).bind(kind)
+                 .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
+@@ -1078,6 +1142,7 @@ async fn github_webhook_from_database(
+     } else {
+         "open"
+     };
++    check_github_binding(state, id).await?;
+     let synced = state
+         .tasks
+         .sync_github_work_item(
+@@ -1156,6 +1221,7 @@ async fn update_github_installation(
+         .immediate_transaction()
+         .await
+         .map_err(|_| ApiError::internal(request_id))?;
++    check_github_binding_tx(state, &mut tx, request_id).await?;
+     let mut changed = false;
+     if event == "installation" && action == "deleted" {
+         changed |= sqlx::query(
+diff --git a/apps/server/src/lib.rs b/apps/server/src/lib.rs
+index 5379f8e..a819dcd 100644
+--- a/apps/server/src/lib.rs
++++ b/apps/server/src/lib.rs
+@@ -12,6 +12,7 @@ pub mod collab;
+ mod email_quota;
+ pub mod export;
+ pub mod export_routes;
++pub mod github_binding;
+ pub mod image_compression;
+ pub mod import_routes;
+ pub mod integration_routes;
+@@ -23,10 +24,10 @@ pub mod mail;
+ pub mod mcp;
+ pub mod metrics;
+ pub mod notion;
+-pub mod obsidian;
+-pub mod obsidian_import_routes;
+ pub mod oauth;
+ pub mod object_storage;
++pub mod obsidian;
++pub mod obsidian_import_routes;
+ pub mod openapi;
+ pub mod page_comment_routes;
+ pub mod page_file_routes;
+diff --git a/apps/server/src/link_preview.rs b/apps/server/src/link_preview.rs
+index 8a501c6..38e5b29 100644
+--- a/apps/server/src/link_preview.rs
++++ b/apps/server/src/link_preview.rs
+@@ -12,7 +12,7 @@ use std::net::IpAddr;
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+-use orbit_platform::{is_public_ip, PublicResolver};
++use orbit_platform::{PublicResolver, is_public_ip};
+ use reqwest::header::{ACCEPT, CONTENT_TYPE};
+ use serde::{Deserialize, Serialize};
+ use tokio::sync::Semaphore;
+@@ -283,11 +283,7 @@ impl LinkPreviewer {
+ }
+ 
+ fn ttl(preview: &Option<LinkPreview>) -> Duration {
+-    if preview.is_some() {
+-        HIT_TTL
+-    } else {
+-        MISS_TTL
+-    }
++    if preview.is_some() { HIT_TTL } else { MISS_TTL }
+ }
+ 
+ /// The start of the body, up to [`MAX_BODY_BYTES`].
+diff --git a/apps/server/src/notion/convert/mod.rs b/apps/server/src/notion/convert/mod.rs
+index 03e52dd..d4790e1 100644
+--- a/apps/server/src/notion/convert/mod.rs
++++ b/apps/server/src/notion/convert/mod.rs
+@@ -933,7 +933,13 @@ fn database_heading(
+     let mut props = default_props(&Value::Null);
+     props.insert("level".into(), json!(2));
+     props.insert("isToggleable".into(), json!(false));
+-    out.push(make_block(ctx, "heading", props, items(content), Vec::new()));
++    out.push(make_block(
++        ctx,
++        "heading",
++        props,
++        items(content),
++        Vec::new(),
++    ));
+ }
+ 
+ /// child_page/child_database/link_to_page → `page` block when imported, else a link paragraph.
+diff --git a/apps/server/src/repositories/sign_in_providers.rs b/apps/server/src/repositories/sign_in_providers.rs
+index d003179..6668cf6 100644
+--- a/apps/server/src/repositories/sign_in_providers.rs
++++ b/apps/server/src/repositories/sign_in_providers.rs
+@@ -178,6 +178,19 @@ async fn identity_owner(
+         .transpose()
+ }
+ 
++async fn check_github_binding(
++    transaction: &mut Transaction<'_, Any>,
++    provider: Provider,
++    host: &orbit_platform::GitHubHost,
++) -> Result<(), sqlx::Error> {
++    if provider == Provider::Github {
++        crate::github_binding::check_in_transaction(transaction, host)
++            .await
++            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
++    }
++    Ok(())
++}
++
+ async fn has_provider(
+     transaction: &mut Transaction<'_, Any>,
+     user_id: Id,
+@@ -233,10 +246,12 @@ impl IdentityRepository {
+     pub async fn provider_account(
+         &self,
+         profile: &ProviderProfile,
++        github_host: &orbit_platform::GitHubHost,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<ProviderAccount, ProviderSignInError> {
+         let mut transaction = self.database().immediate_transaction().await?;
++        check_github_binding(&mut transaction, profile.provider, github_host).await?;
+         let owner = identity_owner(&mut transaction, profile.provider, &profile.subject).await?;
+         let email_account = match (&owner, &profile.verified_email) {
+             (None, Some(email)) => {
+@@ -348,11 +363,13 @@ impl IdentityRepository {
+         &self,
+         user: &AuthenticatedUser,
+         profile: &ProviderProfile,
++        github_host: &orbit_platform::GitHubHost,
+         link: bool,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<IssuedSession, ProviderSignInError> {
+         let mut transaction = self.database().immediate_transaction().await?;
++        check_github_binding(&mut transaction, profile.provider, github_host).await?;
+         let active = sqlx::query_scalar::<_, i64>(
+             "SELECT COUNT(*) FROM users WHERE id = $1 AND suspended_at IS NULL",
+         )
+@@ -413,10 +430,12 @@ impl IdentityRepository {
+         &self,
+         user_id: Id,
+         profile: &ProviderProfile,
++        github_host: &orbit_platform::GitHubHost,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<(), IdentityChangeError> {
+         let mut transaction = self.database().immediate_transaction().await?;
++        check_github_binding(&mut transaction, profile.provider, github_host).await?;
+         match identity_owner(&mut transaction, profile.provider, &profile.subject).await? {
+             Some(owner) if owner == user_id => return Ok(()),
+             Some(_) => return Err(IdentityChangeError::InUse),
+@@ -445,10 +464,12 @@ impl IdentityRepository {
+         session_id: Id,
+         user_id: Id,
+         profile: &ProviderProfile,
++        github_host: &orbit_platform::GitHubHost,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<(), IdentityChangeError> {
+         let mut transaction = self.database().immediate_transaction().await?;
++        check_github_binding(&mut transaction, profile.provider, github_host).await?;
+         if identity_owner(&mut transaction, profile.provider, &profile.subject).await?
+             != Some(user_id)
+         {
+@@ -505,10 +526,12 @@ impl IdentityRepository {
+         &self,
+         user_id: Id,
+         provider: Provider,
++        github_host: &orbit_platform::GitHubHost,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<(), IdentityChangeError> {
+         let mut transaction = self.database().immediate_transaction().await?;
++        check_github_binding(&mut transaction, provider, github_host).await?;
+         let deleted =
+             sqlx::query("DELETE FROM user_identities WHERE user_id = $1 AND provider = $2")
+                 .bind(user_id.to_string())
+@@ -599,16 +622,23 @@ impl InstanceSettingsRepository {
+     }
+ 
+     /// Saves the OAuth client. `client_secret: None` keeps the saved secret.
++    #[allow(clippy::too_many_arguments)]
+     pub async fn save_sign_in_provider(
+         &self,
+         actor_id: Id,
+         provider: Provider,
++        github_host: &orbit_platform::GitHubHost,
+         client_id: &str,
+         client_secret: Option<Vec<u8>>,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<(), SaveSignInProviderError> {
+         let mut transaction = self.database.immediate_transaction().await?;
++        if provider == Provider::Github {
++            crate::github_binding::check_in_transaction(&mut transaction, github_host)
++                .await
++                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
++        }
+         match client_secret {
+             Some(secret) => {
+                 sqlx::query(
+@@ -660,10 +690,16 @@ impl InstanceSettingsRepository {
+         &self,
+         actor_id: Id,
+         provider: Provider,
++        github_host: &orbit_platform::GitHubHost,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<(), sqlx::Error> {
+         let mut transaction = self.database.immediate_transaction().await?;
++        if provider == Provider::Github {
++            crate::github_binding::check_in_transaction(&mut transaction, github_host)
++                .await
++                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
++        }
+         let deleted = sqlx::query("DELETE FROM sign_in_providers WHERE provider = $1")
+             .bind(provider.as_str())
+             .execute(&mut *transaction)
+diff --git a/apps/server/src/repositories/tasks.rs b/apps/server/src/repositories/tasks.rs
+index db17e2d..e9ede64 100644
+--- a/apps/server/src/repositories/tasks.rs
++++ b/apps/server/src/repositories/tasks.rs
+@@ -1,6 +1,8 @@
+ use orbit_domain::{Actor, DEFAULT_STATUSES, StatusCategory};
+ use orbit_platform::SqlBuilder;
+-use orbit_platform::{BLOB_REFERENCE_COUNT, Backend, Database, Flag, Id, Row, TimestampMillis};
++use orbit_platform::{
++    BLOB_REFERENCE_COUNT, Backend, Database, Flag, GitHubHost, Id, Row, TimestampMillis,
++};
+ use serde::{Deserialize, Serialize};
+ use serde_json::{Value, json};
+ use sha2::{Digest, Sha256};
+@@ -425,6 +427,10 @@ pub enum TaskError {
+     TrialLimit(TrialLimitReached),
+ }
+ 
++pub(crate) fn github_binding_error(error: crate::github_binding::GitHubBindingError) -> TaskError {
++    TaskError::Unavailable(sqlx::Error::Protocol(error.to_string()))
++}
++
+ impl From<TrialCapacityError> for TaskError {
+     fn from(error: TrialCapacityError) -> Self {
+         match error {
+@@ -470,6 +476,7 @@ pub struct TokenActor {
+ #[derive(Clone)]
+ pub struct TaskRepository {
+     database: Database,
++    github_host: GitHubHost,
+     project_grant: Option<Vec<Id>>,
+     token: Option<TokenActor>,
+     /// `expected_version` of task updates and deletes is the task's [`revision`].
+@@ -477,6 +484,17 @@ pub struct TaskRepository {
+ }
+ 
+ impl TaskRepository {
++    /// Configure the same GitHub host used to bind the database at application startup.
++    #[must_use]
++    pub fn with_github_host(mut self, host: GitHubHost) -> Self {
++        self.github_host = host;
++        self
++    }
++
++    pub fn github_host(&self) -> &GitHubHost {
++        &self.github_host
++    }
++
+     pub fn with_project_grant(&self, projects: Vec<Id>) -> Self {
+         Self {
+             project_grant: Some(projects),
+@@ -671,6 +689,7 @@ impl TaskRepository {
+     pub fn new(database: Database) -> Self {
+         Self {
+             database,
++            github_host: GitHubHost::default(),
+             project_grant: None,
+             token: None,
+             revisions: false,
+@@ -1851,6 +1870,9 @@ impl TaskRepository {
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<Id, TaskError> {
++        crate::github_binding::check(&self.database, &self.github_host)
++            .await
++            .map_err(github_binding_error)?;
+         // A linked task's live description is replaced with the issue body in the transaction
+         // below; its room is locked first.
+         let linked: Option<String> = sqlx::query_scalar(
+@@ -1871,6 +1893,9 @@ impl TaskRepository {
+             None => None,
+         };
+         let mut tx = self.database.immediate_transaction().await?;
++        crate::github_binding::check_in_transaction(&mut tx, &self.github_host)
++            .await
++            .map_err(github_binding_error)?;
+         require_access_tx(&mut tx, workspace_id, actor_id).await?;
+         let (service_account_id, service_account_name) =
+             github_service_account_in_tx(&mut tx, workspace_id, actor_id, now).await?;
+@@ -1880,24 +1905,31 @@ impl TaskRepository {
+                 .bind(workspace_id.to_string()).bind(&issue.repository).bind(issue.number)
+                 .execute(&mut *tx).await?;
+         }
+-        let path = if issue.kind == "pull_request" {
+-            "pull"
++        let (owner, repo) = issue.repository.split_once('/').ok_or(TaskError::Invalid {
++            field: "repository",
++        })?;
++        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
++            return Err(TaskError::Invalid {
++                field: "repository",
++            });
++        }
++        let issue_url = if issue.kind == "pull_request" {
++            self.github_host.pull_url(owner, repo, issue.number)
+         } else {
+-            "issues"
++            self.github_host.issue_url(owner, repo, issue.number)
+         };
+-        let issue_url = format!(
+-            "https://github.com/{}/{path}/{}",
+-            issue.repository, issue.number
+-        );
+         let status_category = match (issue.kind, issue.state) {
+             ("pull_request", "merged") | ("issue", "closed") => "completed",
+             ("pull_request", "closed") => "cancelled",
+             _ => "unstarted",
+         };
+         let existing = sqlx::query(
+-            "SELECT github_issue_links.task_id, github_issue_links.kind, tasks.project_id, tasks.status_id, tasks.deleted_at FROM github_issue_links JOIN tasks ON tasks.id = github_issue_links.task_id WHERE github_issue_links.workspace_id = $1 AND repository = $2 AND issue_number = $3",
++            "SELECT github_issue_links.task_id, github_issue_links.kind, tasks.project_id, tasks.status_id, tasks.deleted_at, tasks.source_url FROM github_issue_links JOIN tasks ON tasks.id = github_issue_links.task_id WHERE github_issue_links.workspace_id = $1 AND repository = $2 AND issue_number = $3",
+         ).bind(workspace_id.to_string()).bind(&issue.repository).bind(issue.number).fetch_optional(&mut *tx).await?;
+         if let Some(row) = &existing {
++            let issue_url = row
++                .get::<Option<String>, _>("source_url")
++                .unwrap_or(issue_url);
+             let was_deleted = row.get::<Option<i64>, _>("deleted_at").is_some();
+             let task_id = parse_id(row.get("task_id"))?;
+             if was_deleted {
+diff --git a/apps/server/src/repositories/two_factor.rs b/apps/server/src/repositories/two_factor.rs
+index f7c4535..d653f80 100644
+--- a/apps/server/src/repositories/two_factor.rs
++++ b/apps/server/src/repositories/two_factor.rs
+@@ -230,7 +230,18 @@ impl IdentityRepository {
+ 
+     /// Records that a code for `step` was used, so the same code cannot sign in again. False when a code for this
+     /// step or a newer one was already accepted.
+-    pub async fn use_totp_step(&self, user_id: Id, step: i64) -> Result<bool, IdentityError> {
++    pub async fn use_totp_step(
++        &self,
++        user_id: Id,
++        step: i64,
++        github_host: Option<&orbit_platform::GitHubHost>,
++    ) -> Result<bool, IdentityError> {
++        let mut transaction = self.database().immediate_transaction().await?;
++        if let Some(host) = github_host {
++            crate::github_binding::check_in_transaction(&mut transaction, host)
++                .await
++                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
++        }
+         let changed = sqlx::query(
+             "UPDATE user_totp SET last_used_step = $1 \
+              WHERE user_id = $2 AND enabled_at IS NOT NULL AND last_used_step < $3",
+@@ -238,9 +249,10 @@ impl IdentityRepository {
+         .bind(step)
+         .bind(user_id.to_string())
+         .bind(step)
+-        .execute(self.database().pool())
++        .execute(&mut *transaction)
+         .await?
+         .rows_affected();
++        transaction.commit().await?;
+         Ok(changed == 1)
+     }
+ 
+@@ -250,10 +262,16 @@ impl IdentityRepository {
+         user_id: Id,
+         code: &str,
+         codes_key: &RecoveryCodeKey,
++        github_host: Option<&orbit_platform::GitHubHost>,
+         request_id: &str,
+         now: TimestampMillis,
+     ) -> Result<bool, IdentityError> {
+         let mut transaction = self.database().immediate_transaction().await?;
++        if let Some(host) = github_host {
++            crate::github_binding::check_in_transaction(&mut transaction, host)
++                .await
++                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
++        }
+         // Codes made before the HMAC are stored as a plain SHA-256 and keep working until they are used or
+         // replaced, so nobody loses their codes. Drop the second hash once no such rows are left.
+         let used = sqlx::query(
+diff --git a/apps/server/src/router.rs b/apps/server/src/router.rs
+index d7f64a0..bb80404 100644
+--- a/apps/server/src/router.rs
++++ b/apps/server/src/router.rs
+@@ -18,19 +18,20 @@ use crate::export_routes::{ExportState, export_router};
+ use crate::import_routes::{ImportState, import_router};
+ use crate::integration_routes::{IntegrationState, integration_router};
+ use crate::linear_import_routes::{LinearImportState, linear_import_router};
++use crate::obsidian_import_routes::{ObsidianImportState, obsidian_import_router};
+ use crate::page_comment_routes::{PageCommentState, page_comment_router};
+ use crate::page_file_routes::{PageFileState, page_file_router};
+ use crate::page_routes::{PageState, page_router};
+ use crate::static_assets::StaticAssets;
+ use crate::task_routes::{TaskState, task_router};
+ use crate::teamspace_routes::{TeamspaceState, teamspace_router};
+-use crate::obsidian_import_routes::{ObsidianImportState, obsidian_import_router};
+ use crate::trello_import_routes::{TrelloImportState, trello_import_router};
+ use crate::view_routes::view_router;
+ use crate::workspace_export_routes::{WorkspaceExportState, workspace_export_router};
+ use crate::workspace_routes::{WorkspaceState, workspace_router};
+ 
+ pub struct ApiRoutes {
++    pub github_host: orbit_platform::GitHubHost,
+     /// Orbit Cloud billing: its routes and the read-only guard. `None` on a self-hosted server.
+     pub billing: Option<crate::billing::Billing>,
+     pub mcp: Router,
+@@ -66,6 +67,7 @@ pub fn production_router(
+     rate_limits: RateLimitConfig,
+     require_secure_transport: bool,
+ ) -> Router {
++    let github_host = api.github_host.clone();
+     let csp_script_hash = assets.csp_script_hash().to_owned();
+     let session_cookie = api.auth.cookie_mode().session_cookie_name();
+     let database = api.auth.database().clone();
+@@ -125,6 +127,7 @@ pub fn production_router(
+             .with_rate_limits(rate_limits)
+             .with_session_cookie(session_cookie)
+             .with_shared_rate_limits(database)
++            .with_csp_github_host(github_host)
+             .with_csp_script_hash(csp_script_hash);
+         if require_secure_transport {
+             layer.require_secure_transport()
+diff --git a/apps/server/src/sign_in_providers.rs b/apps/server/src/sign_in_providers.rs
+index 1e060c2..9d90f3f 100644
+--- a/apps/server/src/sign_in_providers.rs
++++ b/apps/server/src/sign_in_providers.rs
+@@ -83,6 +83,16 @@ impl Default for ProviderEndpoints {
+ }
+ 
+ impl ProviderEndpoints {
++    /// Derive GitHub endpoints from the configured host, retaining the Google endpoints.
++    #[must_use]
++    pub fn with_github_host(mut self, host: &orbit_platform::GitHubHost) -> Self {
++        self.github_authorize =
++            Url::parse(&host.oauth_authorize_url()).expect("validated GitHub URL");
++        self.github_token = Url::parse(&host.oauth_token_url()).expect("validated GitHub URL");
++        self.github_api = Url::parse(&format!("{}/", host.rest_base().trim_end_matches('/')))
++            .expect("validated GitHub URL");
++        self
++    }
+     /// Every endpoint under `base`: `{base}/google/authorize`, `/google/token`, `/google/userinfo`,
+     /// `/github/authorize`, `/github/token`, and the GitHub API at `{base}/github/api/`.
+     #[must_use]
+@@ -193,6 +203,10 @@ impl Default for ProviderClient {
+ }
+ 
+ impl ProviderClient {
++    #[must_use]
++    pub fn with_github_host(self, host: &orbit_platform::GitHubHost) -> Self {
++        Self::new(self.endpoints.with_github_host(host))
++    }
+     #[must_use]
+     pub fn new(endpoints: ProviderEndpoints) -> Self {
+         let http = reqwest::Client::builder()
+@@ -422,6 +436,33 @@ struct GithubEmail {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn enterprise_endpoints_keep_api_prefix_and_leave_google_alone() {
++        for (origin, api) in [
++            (
++                "https://git.example:8443",
++                "https://git.example:8443/api/v3/user",
++            ),
++            ("https://acme.ghe.com", "https://api.acme.ghe.com/user"),
++        ] {
++            let host: orbit_platform::GitHubHost = origin.parse().unwrap();
++            let endpoints = ProviderEndpoints::default().with_github_host(&host);
++            assert_eq!(
++                endpoints.github_authorize.as_str(),
++                format!("{origin}/login/oauth/authorize")
++            );
++            assert_eq!(
++                endpoints.github_token.as_str(),
++                format!("{origin}/login/oauth/access_token")
++            );
++            assert_eq!(endpoints.github_api.join("user").unwrap().as_str(), api);
++            assert_eq!(
++                endpoints.google_token.as_str(),
++                "https://oauth2.googleapis.com/token"
++            );
++        }
++    }
++
+     #[test]
+     fn pkce_challenge_matches_the_rfc_7636_example() {
+         assert_eq!(
+diff --git a/apps/server/src/task_routes.rs b/apps/server/src/task_routes.rs
+index 30da2a7..d301c34 100644
+--- a/apps/server/src/task_routes.rs
++++ b/apps/server/src/task_routes.rs
+@@ -1287,22 +1287,60 @@ pub(crate) async fn list_github_links(
+         .get_task(workspace_id, task_id, actor_id)
+         .await
+         .map_err(|error| task_problem(error, instance.clone(), request_id.as_ref()))?;
+-    let rows = sqlx::query("SELECT kind, repository || '#' || issue_number AS title, 'https://github.com/' || repository || CASE kind WHEN 'pull_request' THEN '/pull/' ELSE '/issues/' END || issue_number AS url, CASE WHEN sync_paused = 1 THEN 'paused' WHEN kind = 'pull_request' THEN pull_state ELSE 'active' END AS state, 1 AS source FROM github_issue_links WHERE workspace_id = $1 AND task_id = $2 UNION ALL SELECT 'pull_request' AS kind, title, url, state, 0 AS source FROM github_pull_links WHERE workspace_id = $3 AND task_id = $4 ORDER BY kind, title")
++    let rows = sqlx::query("SELECT kind, repository || '#' || issue_number AS title, repository, issue_number, NULL AS url, CASE WHEN sync_paused = 1 THEN 'paused' WHEN kind = 'pull_request' THEN pull_state ELSE 'active' END AS state, 1 AS source FROM github_issue_links WHERE workspace_id = $1 AND task_id = $2 UNION ALL SELECT 'pull_request' AS kind, title, NULL AS repository, NULL AS issue_number, url, state, 0 AS source FROM github_pull_links WHERE workspace_id = $3 AND task_id = $4 ORDER BY kind, title")
+         .bind(workspace_id.to_string()).bind(task_id.to_string())
+         .bind(workspace_id.to_string()).bind(task_id.to_string())
+         .fetch_all(state.tasks.database().pool()).await
+-        .map_err(|error| task_problem(TaskError::Unavailable(error), instance, request_id.as_ref()))?;
+-    Ok(Json(
+-        rows.into_iter()
+-            .map(|row| GithubLink {
+-                kind: row.get("kind"),
+-                title: row.get("title"),
+-                url: row.get("url"),
+-                state: row.get("state"),
+-                source: row.get::<i64, _>("source") != 0,
+-            })
+-            .collect(),
+-    ))
++        .map_err(|error| task_problem(TaskError::Unavailable(error), instance.clone(), request_id.as_ref()))?;
++    if !rows.is_empty() {
++        crate::github_binding::check(state.tasks.database(), state.tasks.github_host())
++            .await
++            .map_err(|error| {
++                task_problem(
++                    crate::repositories::tasks::github_binding_error(error),
++                    instance.clone(),
++                    request_id.as_ref(),
++                )
++            })?;
++    }
++    let mut links = Vec::with_capacity(rows.len());
++    for row in rows {
++        let kind: String = row.get("kind");
++        let source = row.get::<i64, _>("source") != 0;
++        let url = if source {
++            let repository: String = row.get("repository");
++            let (owner, repo) = repository
++                .split_once('/')
++                .filter(|(owner, repo)| {
++                    !owner.is_empty() && !repo.is_empty() && !repo.contains('/')
++                })
++                .ok_or_else(|| {
++                    task_problem(
++                        TaskError::Unavailable(sqlx::Error::Protocol(
++                            "invalid GitHub repository".into(),
++                        )),
++                        instance.clone(),
++                        request_id.as_ref(),
++                    )
++                })?;
++            let number: i64 = row.get("issue_number");
++            if kind == "pull_request" {
++                state.tasks.github_host().pull_url(owner, repo, number)
++            } else {
++                state.tasks.github_host().issue_url(owner, repo, number)
++            }
++        } else {
++            row.get("url")
++        };
++        links.push(GithubLink {
++            kind,
++            title: row.get("title"),
++            url,
++            state: row.get("state"),
++            source,
++        });
++    }
++    Ok(Json(links))
+ }
+ 
+ #[utoipa::path(get, path = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/activity", params(PageQuery, ("workspace_id" = String, Path), ("task_id" = String, Path)), responses((status = 200, body = Page<crate::audit::AuditEvent>)))]
+diff --git a/apps/server/src/windows_service.rs b/apps/server/src/windows_service.rs
+index 2a44a5d..2cbfe3c 100644
+--- a/apps/server/src/windows_service.rs
++++ b/apps/server/src/windows_service.rs
+@@ -107,9 +107,9 @@ pub fn uninstall() -> Result<String, String> {
+         )
+     })?;
+     if status.current_state != ServiceState::Stopped {
+-        service
+-            .stop()
+-            .map_err(|error| format!("stopping the {SERVICE_NAME} service: {}", describe(&error)))?;
++        service.stop().map_err(|error| {
++            format!("stopping the {SERVICE_NAME} service: {}", describe(&error))
++        })?;
+     }
+     Ok(format!(
+         "removed the {SERVICE_NAME} service registration (it stays until Windows finishes \
+diff --git a/apps/server/src/workspace_routes.rs b/apps/server/src/workspace_routes.rs
+index 27849d6..3d50c70 100644
+--- a/apps/server/src/workspace_routes.rs
++++ b/apps/server/src/workspace_routes.rs
+@@ -64,6 +64,7 @@ pub struct WorkspaceState {
+     image_compressor: Option<ImageCompressor>,
+     /// Deletes stored files for workspace admins; `None` refuses to.
+     uploads: Option<UploadService>,
++    github_host: orbit_platform::GitHubHost,
+ }
+ 
+ /// Open registration is throttled like sign-in, on every server of the database.
+@@ -97,6 +98,7 @@ impl WorkspaceState {
+             object_storage: None,
+             image_compressor: None,
+             uploads: None,
++            github_host: orbit_platform::GitHubHost::default(),
+         }
+     }
+ 
+@@ -124,9 +126,16 @@ impl WorkspaceState {
+             object_storage: None,
+             image_compressor: None,
+             uploads: None,
++            github_host: orbit_platform::GitHubHost::default(),
+         }
+     }
+ 
++    #[must_use]
++    pub fn with_github_host(mut self, host: orbit_platform::GitHubHost) -> Self {
++        self.github_host = host;
++        self
++    }
++
+     #[must_use]
+     pub fn with_mailer(mut self, mailer: Mailer) -> Self {
+         self.mailer = Some(mailer);
+@@ -2401,6 +2410,7 @@ async fn save_sign_in_provider(
+         .save_sign_in_provider(
+             session.user.id,
+             provider,
++            &state.github_host,
+             client_id,
+             encrypted,
+             request_id_value(rid),
+@@ -2433,6 +2443,7 @@ async fn remove_sign_in_provider(
+         .remove_sign_in_provider(
+             session.user.id,
+             provider,
++            &state.github_host,
+             request_id_value(rid),
+             TimestampMillis::now(),
+         )
+diff --git a/apps/server/tests/app_smoke.rs b/apps/server/tests/app_smoke.rs
+index d61b913..d5b2aae 100644
+--- a/apps/server/tests/app_smoke.rs
++++ b/apps/server/tests/app_smoke.rs
+@@ -205,7 +205,7 @@ async fn app_build_migrates_checks_readiness_and_returns_first_run_setup_url() {
+             .scalar::<i64>("SELECT MAX(version) FROM schema_migrations")
+             .await
+             .unwrap(),
+-        77
++        78
+     );
+ 
+     let readiness = app
+diff --git a/apps/server/tests/github_upgrade_handoff.rs b/apps/server/tests/github_upgrade_handoff.rs
+new file mode 100644
+index 0000000..a20e305
+--- /dev/null
++++ b/apps/server/tests/github_upgrade_handoff.rs
+@@ -0,0 +1,176 @@
++//! Upgrade and rolling-server regressions for GitHub handoffs written before host binding.
++use axum::{
++    body::Body,
++    http::{Request, StatusCode, header},
++};
++use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
++use orbit_platform::{
++    Config, Database, DatabaseConfig, EnvironmentMode, MigrationRunner, TimestampMillis,
++};
++use orbit_server::app::App;
++use serde_json::json;
++use sha2::{Digest, Sha256};
++use tempfile::TempDir;
++use tower::ServiceExt;
++
++const HANDOFF: &str = "legacy-handoff-token";
++const VERIFIER: &str = "legacy-client-verifier";
++
++fn app_config(root: &TempDir) -> Config {
++    let mut config = Config {
++        environment: EnvironmentMode::Development,
++        app_key: Some(orbit_platform::AppKey::new([1; 32])),
++        ..Config::default()
++    };
++    config.data.database = root.path().join("data/orbit.sqlite");
++    config.data.attachments = root.path().join("attachments");
++    config.data.backups = root.path().join("backups");
++    config.github = "https://enterprise.example".parse().unwrap();
++    config
++}
++
++fn payload() -> String {
++    json!({
++        "kind": "provider_handoff",
++        "flow": {"provider": "github", "intent": {"kind": "sign_in"},
++            "client_challenge": URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes())),
++            "redirect": {"kind": "web"}, "return_to": null},
++        "outcome": {"Ok": {"provider": "github", "subject": "123",
++            "verified_email": "new@example.com", "email": "new@example.com", "display_name": "Legacy"}}
++    }).to_string()
++}
++
++async fn seed(database: &Database, orphaned: bool) {
++    if !orphaned {
++        sqlx::query("INSERT INTO sign_in_providers (provider, client_id, client_secret, created_at, updated_at) VALUES ('github', 'legacy', $1, 0, 0)")
++            .bind(vec![1_u8]).execute(database.pool()).await.unwrap();
++    }
++    sqlx::query(
++        "INSERT INTO auth_pending (token_hash, expires_at, payload_json) VALUES ($1, $2, $3)",
++    )
++    .bind(format!("{:x}", Sha256::digest(HANDOFF.as_bytes())))
++    .bind(TimestampMillis::now().as_millis() + 600_000)
++    .bind(payload())
++    .execute(database.pool())
++    .await
++    .unwrap();
++}
++
++async fn assert_preserved(database: &Database) {
++    let pending: (String, i64) =
++        sqlx::query_as("SELECT payload_json, expires_at FROM auth_pending")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(pending.0, payload());
++    assert!(pending.1 > TimestampMillis::now().as_millis());
++    let identities: i64 =
++        sqlx::query_scalar("SELECT COUNT(*) FROM user_identities WHERE provider = 'github'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(identities, 0);
++}
++
++// Database::open maps this unique path to an isolated Postgres database in backend tests.
++// Drop it explicitly, as this fixture needs to close the database before App::build reopens it.
++async fn cleanup_postgres(name: Option<String>) {
++    if let Some(name) = name {
++        use sqlx::Connection;
++        assert!(
++            name.starts_with("orbit_t_")
++                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
++        );
++        let mut connection =
++            sqlx::PgConnection::connect(&std::env::var("ORBIT_TEST_POSTGRES_URL").unwrap())
++                .await
++                .unwrap();
++        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
++            "DROP DATABASE \"{name}\" WITH (FORCE)"
++        )))
++        .execute(&mut connection)
++        .await
++        .unwrap();
++    }
++}
++
++async fn postgres_name(database: &Database) -> Option<String> {
++    if orbit_platform::testing_postgres() {
++        Some(
++            sqlx::query_scalar("SELECT current_database()")
++                .fetch_one(database.pool())
++                .await
++                .unwrap(),
++        )
++    } else {
++        None
++    }
++}
++
++#[tokio::test]
++async fn legacy_handoffs_refuse_enterprise_upgrade_and_rolling_exchange() {
++    for orphaned in [false, true] {
++        let root = TempDir::new().unwrap();
++        let config = app_config(&root);
++        let db_config = DatabaseConfig::for_data(&config.data);
++        let db = Database::open(&db_config).await.unwrap();
++        let name = postgres_name(&db).await;
++        MigrationRunner::embedded_through("legacy", 77)
++            .run(&db)
++            .await
++            .unwrap();
++        seed(&db, orphaned).await;
++        assert_preserved(&db).await;
++        drop(db);
++
++        let error = App::build(config.clone()).await.unwrap_err().to_string();
++        assert!(
++            error.contains("https://github.com") && error.contains("https://enterprise.example"),
++            "{error}"
++        );
++        let db = Database::open(&db_config).await.unwrap();
++        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
++            .fetch_one(db.pool())
++            .await
++            .unwrap();
++        assert_eq!(version, 78);
++        let origin: String =
++            sqlx::query_scalar("SELECT origin FROM github_host_binding WHERE singleton = 1")
++                .fetch_one(db.pool())
++                .await
++                .unwrap();
++        assert_eq!(origin, "https://github.com");
++        assert_preserved(&db).await;
++        drop(db);
++        cleanup_postgres(name).await;
++
++        // An already-running Enterprise server must also fail closed if the binding changes
++        // underneath it (e.g. another server establishes the legacy binding during a rollout).
++        let root = TempDir::new().unwrap();
++        let app = App::build(app_config(&root)).await.unwrap();
++        let name = postgres_name(app.database()).await;
++        seed(app.database(), orphaned).await;
++        sqlx::query(
++            "UPDATE github_host_binding SET origin = 'https://github.com' WHERE singleton = 1",
++        )
++        .execute(app.database().pool())
++        .await
++        .unwrap();
++        let response = app
++            .router()
++            .oneshot(
++                Request::post("/api/v1/auth/providers/exchange")
++                    .header(header::CONTENT_TYPE, "application/json")
++                    .body(Body::from(
++                        json!({"handoff": HANDOFF, "code_verifier": VERIFIER}).to_string(),
++                    ))
++                    .unwrap(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
++        assert_preserved(app.database()).await;
++        drop(app);
++        cleanup_postgres(name).await;
++    }
++}
+diff --git a/apps/server/tests/integrations_api.rs b/apps/server/tests/integrations_api.rs
+index 045e05f..587cabf 100644
+--- a/apps/server/tests/integrations_api.rs
++++ b/apps/server/tests/integrations_api.rs
+@@ -19,6 +19,69 @@ use serde_json::{Value, json};
+ use sha2::Sha256;
+ use tower::ServiceExt;
+ 
++#[tokio::test]
++async fn enterprise_manifest_and_binding_guard() {
++    let fixture = fixture().await;
++    let host: orbit_platform::GitHubHost = "https://github.enterprise.test".parse().unwrap();
++    sqlx::query("UPDATE github_host_binding SET origin = $1 WHERE singleton = 1")
++        .bind(host.web_origin())
++        .execute(fixture.database.pool())
++        .await
++        .unwrap();
++    let state = IntegrationState::new(
++        Arc::new(fixture.tokens.clone()),
++        Arc::new(TaskRepository::new((*fixture.database).clone())),
++    )
++    .with_github_settings(
++        Arc::new(IdentityRepository::new((*fixture.database).clone())),
++        CookieMode::secure(),
++        "https://orbit.test".to_owned(),
++        false,
++        Some([7; 32]),
++    )
++    .with_github_host(host);
++    let app = integration_router(state);
++    let path = format!(
++        "/api/v1/workspaces/{}/github/manifest",
++        fixture.workspace_id
++    );
++    let request = || {
++        Request::builder()
++            .method("POST")
++            .uri(&path)
++            .header(header::COOKIE, &fixture.session_cookie)
++            .header(header::CONTENT_TYPE, "application/json")
++            .body(Body::from(r#"{"organization":"acme"}"#))
++            .unwrap()
++    };
++    let response = app.clone().oneshot(request()).await.unwrap();
++    assert_eq!(response.status(), StatusCode::OK);
++    assert!(
++        response_json(response).await["action"]
++            .as_str()
++            .unwrap()
++            .starts_with(
++                "https://github.enterprise.test/organizations/acme/settings/apps/new?state="
++            )
++    );
++    sqlx::query("UPDATE github_host_binding SET origin = $1 WHERE singleton = 1")
++        .bind("https://github.com")
++        .execute(fixture.database.pool())
++        .await
++        .unwrap();
++    assert_eq!(
++        app.clone().oneshot(request()).await.unwrap().status(),
++        StatusCode::SERVICE_UNAVAILABLE
++    );
++    assert_eq!(
++        app.oneshot(github_request("ping", json!({}), true))
++            .await
++            .unwrap()
++            .status(),
++        StatusCode::SERVICE_UNAVAILABLE
++    );
++}
++
+ #[tokio::test]
+ async fn database_github_app_routes_issues_without_orbit_tokens() {
+     let fixture = fixture().await;
+@@ -1724,6 +1787,9 @@ struct Fixture {
+ 
+ async fn fixture() -> Fixture {
+     let database = TestDatabase::new().await.unwrap();
++    orbit_server::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
++        .await
++        .unwrap();
+     let identity = IdentityRepository::new((*database).clone());
+     let now = TimestampMillis::now();
+     identity
+diff --git a/apps/server/tests/sign_in_providers_api.rs b/apps/server/tests/sign_in_providers_api.rs
+index 0b7c934..6d35dce 100644
+--- a/apps/server/tests/sign_in_providers_api.rs
++++ b/apps/server/tests/sign_in_providers_api.rs
+@@ -224,6 +224,9 @@ struct Fixture {
+ impl Fixture {
+     async fn new() -> Self {
+         let database = TestDatabase::new().await.unwrap();
++        orbit_server::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
++            .await
++            .unwrap();
+         let identity = Arc::new(IdentityRepository::new((*database).clone()));
+         let now = TimestampMillis::now();
+         identity
+@@ -434,6 +437,218 @@ fn web_handoff(location: &str) -> String {
+         .into_owned()
+ }
+ 
++#[tokio::test]
++async fn changed_github_binding_blocks_start_callback_and_pending_handoffs() {
++    let fixture = Fixture::new().await;
++    let (callback, verifier) = fixture
++        .through_callback(
++            "github",
++            "sign_in",
++            "web",
++            github(42, "owner@example.com"),
++            None,
++        )
++        .await;
++    fixture
++        .database
++        .execute(
++            "UPDATE github_host_binding SET origin = 'https://other.example' WHERE singleton = 1",
++        )
++        .await
++        .unwrap();
++    let start = fixture
++        .start(
++            "github",
++            json!({"intent": "sign_in", "code_challenge": challenge("v"), "redirect": "web"}),
++            None,
++        )
++        .await;
++    assert_eq!(start.status, StatusCode::INTERNAL_SERVER_ERROR);
++    let callback_again = fixture
++        .send(
++            "GET",
++            "/api/v1/auth/providers/github/callback?state=unused&code=c",
++            None,
++            false,
++            None,
++        )
++        .await;
++    assert_eq!(callback_again.status, StatusCode::SEE_OTHER);
++    let exchange = fixture
++        .exchange(
++            &web_handoff(callback.location()),
++            &verifier,
++            Client::Web,
++            None,
++        )
++        .await;
++    assert_eq!(exchange.status, StatusCode::INTERNAL_SERVER_ERROR);
++    let google_start = fixture
++        .start(
++            "google",
++            json!({"intent": "sign_in", "code_challenge": challenge("v"), "redirect": "web"}),
++            None,
++        )
++        .await;
++    assert_eq!(google_start.status, StatusCode::OK);
++    let challenge = fixture
++        .flow(
++            "google",
++            "sign_in",
++            google("g-owner", "owner@example.com"),
++            None,
++        )
++        .await;
++    assert_eq!(challenge.status, StatusCode::ACCEPTED);
++    let signed_in = fixture.link(&challenge, PASSWORD, Client::Web).await;
++    assert_eq!(signed_in.status, StatusCode::OK);
++    let save = fixture
++        .admin_save("github", json!({"client_id": "changed"}))
++        .await;
++    assert_eq!(save.status, StatusCode::INTERNAL_SERVER_ERROR);
++    let remove = fixture
++        .send(
++            "DELETE",
++            "/api/v1/admin/settings/sign-in-providers/github",
++            Some(&fixture.owner_cookie),
++            true,
++            None,
++        )
++        .await;
++    assert_eq!(remove.status, StatusCode::INTERNAL_SERVER_ERROR);
++    let google_save = fixture
++        .admin_save("google", json!({"client_id": "changed"}))
++        .await;
++    assert_eq!(google_save.status, StatusCode::OK);
++
++    fixture
++        .database
++        .execute("UPDATE github_host_binding SET origin = 'https://github.com' WHERE singleton = 1")
++        .await
++        .unwrap();
++    let retry = fixture
++        .exchange(
++            &web_handoff(callback.location()),
++            &verifier,
++            Client::Web,
++            None,
++        )
++        .await;
++    assert_eq!(retry.status, StatusCode::ACCEPTED, "{}", retry.body);
++}
++
++#[tokio::test]
++async fn github_identity_transactions_refuse_mismatched_binding() {
++    use orbit_platform::{AuthenticatedUser, GitHubHost, Id};
++    use orbit_server::sign_in_providers::{Provider, ProviderProfile};
++    let fixture = Fixture::new().await;
++    let user_id: Id = fixture
++        .database
++        .scalar::<String>("SELECT id FROM users WHERE email = 'owner@example.com'")
++        .await
++        .unwrap()
++        .parse()
++        .unwrap();
++    let user = AuthenticatedUser {
++        id: user_id,
++        email: "owner@example.com".to_owned(),
++        display_name: "Owner".to_owned(),
++    };
++    let profile = ProviderProfile {
++        provider: Provider::Github,
++        subject: "42".to_owned(),
++        verified_email: Some(user.email.clone()),
++        email: Some(user.email.clone()),
++        display_name: "octocat".to_owned(),
++    };
++    let host = GitHubHost::default();
++    let repo = IdentityRepository::new((*fixture.database).clone());
++    fixture
++        .database
++        .execute(
++            "UPDATE github_host_binding SET origin = 'https://other.example' WHERE singleton = 1",
++        )
++        .await
++        .unwrap();
++    let now = TimestampMillis::now();
++    assert!(
++        repo.provider_account(&profile, &host, "test", now)
++            .await
++            .is_err()
++    );
++    assert!(
++        repo.create_provider_session_audited(&user, &profile, &host, true, "test", now)
++            .await
++            .is_err()
++    );
++    assert!(
++        repo.connect_identity(user_id, &profile, &host, "test", now)
++            .await
++            .is_err()
++    );
++    assert!(
++        repo.confirm_with_provider(Id::new_v7(), user_id, &profile, &host, "test", now)
++            .await
++            .is_err()
++    );
++    assert!(
++        repo.disconnect_identity(user_id, Provider::Github, &host, "test", now)
++            .await
++            .is_err()
++    );
++    assert_eq!(
++        fixture
++            .scalar_i64("SELECT COUNT(*) FROM user_identities")
++            .await,
++        0
++    );
++    assert_eq!(fixture.scalar_i64("SELECT COUNT(*) FROM sessions").await, 1);
++}
++
++#[tokio::test]
++async fn mismatched_github_binding_does_not_block_password_two_factor() {
++    let fixture = Fixture::new().await;
++    let setup = fixture
++        .send(
++            "POST",
++            "/api/v1/auth/two-factor/totp/setup",
++            Some(&fixture.owner_cookie),
++            true,
++            Some(json!({"password": PASSWORD})),
++        )
++        .await;
++    let secret = setup.body["secret"].as_str().unwrap();
++    let enabled = fixture
++        .send(
++            "POST",
++            "/api/v1/auth/two-factor/totp/enable",
++            Some(&fixture.owner_cookie),
++            true,
++            Some(json!({"code": totp_code(secret, -1)})),
++        )
++        .await;
++    assert_eq!(enabled.status, StatusCode::OK);
++    let login = fixture
++        .send(
++            "POST",
++            "/api/v1/auth/login",
++            None,
++            true,
++            Some(json!({"email": "owner@example.com", "password": PASSWORD})),
++        )
++        .await;
++    assert_eq!(login.status, StatusCode::ACCEPTED);
++    fixture
++        .database
++        .execute(
++            "UPDATE github_host_binding SET origin = 'https://other.example' WHERE singleton = 1",
++        )
++        .await
++        .unwrap();
++    let result = fixture.send("POST", "/api/v1/auth/login/two-factor", None, true, Some(json!({"two_factor_token": login.body["two_factor_token"], "code": totp_code(secret, 0)}))).await;
++    assert_eq!(result.status, StatusCode::OK, "{}", result.body);
++}
++
+ #[tokio::test]
+ async fn admin_saves_providers_with_an_encrypted_secret_that_an_empty_save_keeps() {
+     let fixture = Fixture::new().await;
+diff --git a/apps/server/tests/storage_api.rs b/apps/server/tests/storage_api.rs
+index c96d6ab..e87b10b 100644
+--- a/apps/server/tests/storage_api.rs
++++ b/apps/server/tests/storage_api.rs
+@@ -315,11 +315,7 @@ async fn rejected_s3_credentials_do_not_stop_attachment_reconciliation() {
+         ..ObjectStorageState::default()
+     });
+     let mutations = AttachmentMutationCoordinator::default();
+-    let store = TieredBlobStore::new(
+-        LocalBlobStore::new(root.path()),
+-        storage,
+-        mutations.clone(),
+-    );
++    let store = TieredBlobStore::new(LocalBlobStore::new(root.path()), storage, mutations.clone());
+     let uploads = UploadService::new(
+         (*fixture.database).clone(),
+         Arc::new(store),
+diff --git a/apps/server/tests/tasks_api.rs b/apps/server/tests/tasks_api.rs
+index 8333dbd..2944386 100644
+--- a/apps/server/tests/tasks_api.rs
++++ b/apps/server/tests/tasks_api.rs
+@@ -30,6 +30,9 @@ struct Fixture {
+ impl Fixture {
+     async fn new() -> Self {
+         let database = TestDatabase::new().await.unwrap();
++        orbit_server::github_binding::bind(&database, &Default::default())
++            .await
++            .unwrap();
+         let identity = Arc::new(IdentityRepository::new((*database).clone()));
+         let now = TimestampMillis::now();
+         identity
+@@ -96,6 +99,120 @@ impl Fixture {
+     }
+ }
+ 
++#[tokio::test]
++async fn enterprise_github_links_use_bound_host_and_reject_mismatch() {
++    for origin in ["https://git.example:8443", "https://acme.ghe.com"] {
++        let fixture = Fixture::new().await;
++        sqlx::query("UPDATE github_host_binding SET origin = $1 WHERE singleton = 1")
++            .bind(origin)
++            .execute(fixture.database.pool())
++            .await
++            .unwrap();
++        let host = origin.parse().unwrap();
++        let repository =
++            Arc::new(TaskRepository::new((*fixture.database).clone()).with_github_host(host));
++        let workspace = fixture.workspace_id.parse().unwrap();
++        let project = fixture.project_id.parse().unwrap();
++        let work_item = |kind, number| GithubWorkItem {
++            repository: "acme/repo".into(),
++            number,
++            project_id: project,
++            title: "GitHub task".into(),
++            description: String::new(),
++            kind,
++            state: "open",
++            state_changed: false,
++        };
++        for (kind, number, path) in [("issue", 12, "issues"), ("pull_request", 8, "pull")] {
++            let task_id = repository
++                .sync_github_work_item(
++                    workspace,
++                    fixture.owner_id,
++                    work_item(kind, number),
++                    "test",
++                    TimestampMillis::now(),
++                )
++                .await
++                .unwrap();
++            let stored: String = sqlx::query_scalar("SELECT source_url FROM tasks WHERE id = $1")
++                .bind(task_id.to_string())
++                .fetch_one(fixture.database.pool())
++                .await
++                .unwrap();
++            assert_eq!(stored, format!("{origin}/acme/repo/{path}/{number}"));
++            let app = task_router(TaskState::with_repository(
++                Arc::clone(&fixture.identity),
++                Arc::clone(&repository),
++                CookieMode::secure(),
++            ));
++            let uri = format!(
++                "/api/v1/workspaces/{}/tasks/{task_id}/github-links",
++                fixture.workspace_id
++            );
++            let response = app
++                .oneshot(
++                    Request::builder()
++                        .uri(&uri)
++                        .header(header::COOKIE, &fixture.owner_cookie)
++                        .body(Body::empty())
++                        .unwrap(),
++                )
++                .await
++                .unwrap();
++            assert_eq!(response.status(), StatusCode::OK);
++            assert_eq!(response_json(response).await[0]["url"], stored);
++            sqlx::query("UPDATE tasks SET source_url = $1 WHERE id = $2")
++                .bind("https://old.example/kept")
++                .bind(task_id.to_string())
++                .execute(fixture.database.pool())
++                .await
++                .unwrap();
++            repository
++                .sync_github_work_item(
++                    workspace,
++                    fixture.owner_id,
++                    work_item(kind, number),
++                    "test",
++                    TimestampMillis::now(),
++                )
++                .await
++                .unwrap();
++            let retained: String = sqlx::query_scalar("SELECT source_url FROM tasks WHERE id = $1")
++                .bind(task_id.to_string())
++                .fetch_one(fixture.database.pool())
++                .await
++                .unwrap();
++            assert_eq!(retained, "https://old.example/kept");
++            let mismatch = fixture
++                .app
++                .clone()
++                .oneshot(
++                    Request::builder()
++                        .uri(&uri)
++                        .header(header::COOKIE, &fixture.owner_cookie)
++                        .body(Body::empty())
++                        .unwrap(),
++                )
++                .await
++                .unwrap();
++            assert_eq!(mismatch.status(), StatusCode::INTERNAL_SERVER_ERROR);
++        }
++        let wrong = TaskRepository::new((*fixture.database).clone());
++        assert!(
++            wrong
++                .sync_github_work_item(
++                    workspace,
++                    fixture.owner_id,
++                    work_item("issue", 99),
++                    "test",
++                    TimestampMillis::now()
++                )
++                .await
++                .is_err()
++        );
++    }
++}
++
+ #[tokio::test]
+ async fn github_issue_link_reports_paused_sync_state() {
+     let fixture = Fixture::new().await;
+diff --git a/apps/server/tests/two_factor_api.rs b/apps/server/tests/two_factor_api.rs
+index 65a4233..9b0aff0 100644
+--- a/apps/server/tests/two_factor_api.rs
++++ b/apps/server/tests/two_factor_api.rs
+@@ -27,6 +27,9 @@ impl Fixture {
+ 
+     async fn with_state(configure: impl FnOnce(AuthState) -> AuthState) -> Self {
+         let database = TestDatabase::new().await.unwrap();
++        orbit_server::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
++            .await
++            .unwrap();
+         let identity = Arc::new(IdentityRepository::new((*database).clone()));
+         let now = TimestampMillis::now();
+         identity
+diff --git a/crates/platform/src/backup.rs b/crates/platform/src/backup.rs
+index 0463c0b..3385b65 100644
+--- a/crates/platform/src/backup.rs
++++ b/crates/platform/src/backup.rs
+@@ -33,7 +33,7 @@ const DOWNLOADS: &str = "downloads";
+ const DOWNLOAD_CACHE_MILLIS: u128 = 60 * 60 * 1000;
+ /// [`BackupService::verified_snapshot`] checks a snapshot's hashes again after this long.
+ const VERIFIED_FOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+-const SUPPORTED_SCHEMA_VERSION: i64 = 77;
++const SUPPORTED_SCHEMA_VERSION: i64 = 78;
+ /// Retention keeps up to this many snapshots from the last day, so a manual or hourly backup does not replace an
+ /// earlier one from the same day.
+ const RECENT_SNAPSHOTS: usize = 24;
+diff --git a/crates/platform/src/config.rs b/crates/platform/src/config.rs
+index 04b5fdd..490b0ae 100644
+--- a/crates/platform/src/config.rs
++++ b/crates/platform/src/config.rs
+@@ -12,6 +12,7 @@ use thiserror::Error;
+ 
+ const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
+ const HTTP_PORT_ENV: &str = "ORBIT_PORT";
++const GITHUB_URL_ENV: &str = "ORBIT_GITHUB_URL";
+ const HTTP_BIND_ENV: &str = "ORBIT_BIND";
+ const HTTP_PUBLIC_ORIGIN_ENV: &str = "ORBIT_PUBLIC_ORIGIN";
+ const HTTP_TRUSTED_PROXIES_ENV: &str = "ORBIT_TRUSTED_PROXIES";
+@@ -46,6 +47,7 @@ const IGNORED_ENV_PREFIXES: [&str; 2] = ["ORBIT_DEV_", "ORBIT_TEST_"];
+ 
+ #[derive(Clone, Debug, Default, Eq, PartialEq)]
+ pub struct Config {
++    pub github: crate::GitHubHost,
+     pub environment: EnvironmentMode,
+     pub http: HttpConfig,
+     pub data: DataConfig,
+@@ -823,6 +825,13 @@ fn apply_environment(
+     for (key, value) in environment {
+         if key == ENVIRONMENT_ENV {
+             config.environment = parse_environment(key, value)?;
++        } else if key == GITHUB_URL_ENV {
++            config.github = value.parse().map_err(|error: crate::InvalidGitHubHost| {
++                ConfigError::InvalidSetting {
++                    key: GITHUB_URL_ENV,
++                    detail: error.to_string(),
++                }
++            })?;
+         } else if key == HTTP_PORT_ENV {
+             config.http.port = value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                 key: key.clone(),
+@@ -1015,6 +1024,25 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn github_url_is_configured_and_normalized() {
++        assert_eq!(production(&[]).github, crate::GitHubHost::default());
++        let config = production(&[("ORBIT_GITHUB_URL", "https://Git.Example:443/")]);
++        assert_eq!(config.github.web_origin(), "https://git.example");
++        let mut env = BTreeMap::new();
++        env.insert(
++            "ORBIT_GITHUB_URL".to_owned(),
++            "http://git.example".to_owned(),
++        );
++        assert!(matches!(
++            Config::from_environment(env),
++            Err(ConfigError::InvalidSetting {
++                key: GITHUB_URL_ENV,
++                ..
++            })
++        ));
++    }
++
+     #[test]
+     fn a_narrow_proxy_and_loopback_metrics_give_no_warning() {
+         let config = production(&[("ORBIT_METRICS_LISTEN", "127.0.0.1:9090")]);
+diff --git a/crates/platform/src/db/migrate.rs b/crates/platform/src/db/migrate.rs
+index 4c06742..30b8eca 100644
+--- a/crates/platform/src/db/migrate.rs
++++ b/crates/platform/src/db/migrate.rs
+@@ -521,6 +521,11 @@ impl MigrationRunner {
+                     include_str!("../../../../apps/server/migrations/0077_chat_interactivity.sql"),
+                     false,
+                 ),
++                Migration::new(
++                    78,
++                    include_str!("../../../../apps/server/migrations/0078_github_host.sql"),
++                    false,
++                ),
+             ],
+         );
+         runner.postgres = vec![
+@@ -712,6 +717,11 @@ impl MigrationRunner {
+                 ),
+                 false,
+             ),
++            Migration::new(
++                78,
++                include_str!("../../../../apps/server/migrations/postgres/0078_github_host.sql"),
++                false,
++            ),
+         ];
+         runner
+     }
+diff --git a/crates/platform/src/github.rs b/crates/platform/src/github.rs
+new file mode 100644
+index 0000000..6b5c716
+--- /dev/null
++++ b/crates/platform/src/github.rs
+@@ -0,0 +1,269 @@
++use std::str::FromStr;
++
++/// One GitHub installation's canonical web origin and derived API endpoints.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct GitHubHost {
++    origin: url::Url,
++    kind: GitHubHostKind,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum GitHubHostKind {
++    Dotcom,
++    Ghec,
++    Ghes,
++}
++
++#[derive(Debug, thiserror::Error)]
++#[error(
++    "must be an HTTPS origin without credentials, path, query or fragment; ghe.com requires exactly one subdomain"
++)]
++pub struct InvalidGitHubHost;
++
++impl Default for GitHubHost {
++    fn default() -> Self {
++        "https://github.com".parse().expect("default GitHub origin")
++    }
++}
++
++impl FromStr for GitHubHost {
++    type Err = InvalidGitHubHost;
++
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        let mut origin = url::Url::parse(value).map_err(|_| InvalidGitHubHost)?;
++        if origin.scheme() != "https"
++            || origin.host_str().is_none()
++            || !origin.username().is_empty()
++            || origin.password().is_some()
++            || origin.path() != "/"
++            || origin.query().is_some()
++            || origin.fragment().is_some()
++            || value.contains('@')
++            || value.contains('\\')
++        {
++            return Err(InvalidGitHubHost);
++        }
++        // Reject path syntax even if URL normalization would collapse it to '/'.
++        let authority_and_path = value.split_once("://").ok_or(InvalidGitHubHost)?.1;
++        if authority_and_path
++            .find('/')
++            .is_some_and(|i| &authority_and_path[i..] != "/")
++        {
++            return Err(InvalidGitHubHost);
++        }
++        let normalized_host = origin
++            .host_str()
++            .ok_or(InvalidGitHubHost)?
++            .trim_end_matches('.')
++            .to_owned();
++        if normalized_host.is_empty() {
++            return Err(InvalidGitHubHost);
++        }
++        origin
++            .set_host(Some(&normalized_host))
++            .map_err(|_| InvalidGitHubHost)?;
++        let host = origin.host_str().ok_or(InvalidGitHubHost)?;
++        let kind = if host == "github.com" {
++            GitHubHostKind::Dotcom
++        } else if host == "ghe.com" {
++            return Err(InvalidGitHubHost);
++        } else if let Some(prefix) = host.strip_suffix(".ghe.com") {
++            if prefix.is_empty() || prefix.contains('.') {
++                return Err(InvalidGitHubHost);
++            }
++            GitHubHostKind::Ghec
++        } else {
++            GitHubHostKind::Ghes
++        };
++        Ok(Self { origin, kind })
++    }
++}
++
++impl GitHubHost {
++    pub fn kind(&self) -> GitHubHostKind {
++        self.kind
++    }
++    /// Canonical origin without a trailing slash.
++    pub fn web_origin(&self) -> &str {
++        self.origin.as_str().trim_end_matches('/')
++    }
++    /// REST API base URL, with a trailing slash for joining relative API paths.
++    pub fn rest_base(&self) -> String {
++        match self.kind {
++            GitHubHostKind::Dotcom => "https://api.github.com/".to_owned(),
++            GitHubHostKind::Ghec => format!(
++                "https://api.{}{}/",
++                self.origin.host_str().unwrap(),
++                self.port_suffix()
++            ),
++            GitHubHostKind::Ghes => format!("{}/api/v3/", self.web_origin()),
++        }
++    }
++    pub fn graphql_url(&self) -> String {
++        match self.kind {
++            GitHubHostKind::Ghes => format!("{}/api/graphql", self.web_origin()),
++            _ => format!("{}graphql", self.rest_base()),
++        }
++    }
++    fn port_suffix(&self) -> String {
++        self.origin
++            .port()
++            .map(|p| format!(":{p}"))
++            .unwrap_or_default()
++    }
++    fn web_path(&self, segments: &[&str]) -> String {
++        let mut url = self.origin.clone();
++        url.path_segments_mut()
++            .expect("HTTPS origin is a base URL")
++            .clear()
++            .extend(segments.iter().copied());
++        url.into()
++    }
++    pub fn oauth_authorize_url(&self) -> String {
++        self.web_path(&["login", "oauth", "authorize"])
++    }
++    pub fn oauth_token_url(&self) -> String {
++        self.web_path(&["login", "oauth", "access_token"])
++    }
++    pub fn manifest_url(&self, organization: Option<&str>) -> String {
++        match organization {
++            Some(org) => self.web_path(&["organizations", org, "settings", "apps", "new"]),
++            None => self.web_path(&["settings", "apps", "new"]),
++        }
++    }
++    pub fn installation_url(&self, slug: &str) -> String {
++        self.web_path(&["apps", slug, "installations", "new"])
++    }
++    pub fn issue_url(&self, owner: &str, repo: &str, number: i64) -> String {
++        self.web_path(&[owner, repo, "issues", &number.to_string()])
++    }
++    pub fn pull_url(&self, owner: &str, repo: &str, number: i64) -> String {
++        self.web_path(&[owner, repo, "pull", &number.to_string()])
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn hosts_and_endpoints() {
++        for (input, origin, kind, rest, graphql) in [
++            (
++                "https://GITHUB.com:443/",
++                "https://github.com",
++                GitHubHostKind::Dotcom,
++                "https://api.github.com/",
++                "https://api.github.com/graphql",
++            ),
++            (
++                "https://Acme.GHE.com/",
++                "https://acme.ghe.com",
++                GitHubHostKind::Ghec,
++                "https://api.acme.ghe.com/",
++                "https://api.acme.ghe.com/graphql",
++            ),
++            (
++                "https://acme.ghe.com:8443",
++                "https://acme.ghe.com:8443",
++                GitHubHostKind::Ghec,
++                "https://api.acme.ghe.com:8443/",
++                "https://api.acme.ghe.com:8443/graphql",
++            ),
++            (
++                "https://git.example:8443",
++                "https://git.example:8443",
++                GitHubHostKind::Ghes,
++                "https://git.example:8443/api/v3/",
++                "https://git.example:8443/api/graphql",
++            ),
++            (
++                "https://git.example.",
++                "https://git.example",
++                GitHubHostKind::Ghes,
++                "https://git.example/api/v3/",
++                "https://git.example/api/graphql",
++            ),
++        ] {
++            let host: GitHubHost = input.parse().unwrap();
++            assert_eq!(host.web_origin(), origin);
++            assert_eq!(host.kind(), kind);
++            assert_eq!(host.rest_base(), rest);
++            assert_eq!(host.graphql_url(), graphql);
++            assert_eq!(
++                host.oauth_authorize_url(),
++                format!("{origin}/login/oauth/authorize")
++            );
++            assert_eq!(
++                host.oauth_token_url(),
++                format!("{origin}/login/oauth/access_token")
++            );
++            assert_eq!(
++                host.manifest_url(None),
++                format!("{origin}/settings/apps/new")
++            );
++            assert_eq!(
++                host.manifest_url(Some("org")),
++                format!("{origin}/organizations/org/settings/apps/new")
++            );
++            assert_eq!(
++                host.installation_url("app"),
++                format!("{origin}/apps/app/installations/new")
++            );
++            assert_eq!(
++                host.issue_url("owner", "repo", 42),
++                format!("{origin}/owner/repo/issues/42")
++            );
++            assert_eq!(
++                host.pull_url("owner", "repo", 42),
++                format!("{origin}/owner/repo/pull/42")
++            );
++            assert_eq!(
++                url::Url::parse(&host.rest_base())
++                    .unwrap()
++                    .join("user")
++                    .unwrap()
++                    .as_str(),
++                format!("{rest}user")
++            );
++        }
++        assert_eq!(GitHubHost::default().web_origin(), "https://github.com");
++        let host = GitHubHost::default();
++        assert_eq!(
++            host.issue_url("a/b", "c d", 7),
++            "https://github.com/a%2Fb/c%20d/issues/7"
++        );
++        assert_eq!(
++            host.manifest_url(Some("a/b")),
++            "https://github.com/organizations/a%2Fb/settings/apps/new"
++        );
++    }
++
++    #[test]
++    fn rejects_invalid_origins() {
++        for invalid in [
++            "",
++            "github.com",
++            "//github.com",
++            "ftp://github.com",
++            "https://",
++            "http://github.com",
++            "https://u@github.com",
++            "https://u:p@github.com",
++            "https://@github.com",
++            "https://github.com/x",
++            "https://github.com//",
++            "https://github.com/.",
++            "https://github.com/%2e%2e",
++            "https://github.com/?",
++            "https://github.com/#",
++            "https://ghe.com",
++            "https://ghe.com.",
++            "https://a.b.ghe.com",
++            "https://a.b.ghe.com.",
++            "https://github.com\\evil",
++            "https://github.com/a/..",
++        ] {
++            assert!(invalid.parse::<GitHubHost>().is_err(), "{invalid}");
++        }
++    }
++}
+diff --git a/crates/platform/src/http/mod.rs b/crates/platform/src/http/mod.rs
+index 328bbde..4d56af5 100644
+--- a/crates/platform/src/http/mod.rs
++++ b/crates/platform/src/http/mod.rs
+@@ -16,7 +16,7 @@ use axum::http::{Request, Response, StatusCode};
+ use axum::response::Response as AxumResponse;
+ use tower::{Layer, Service};
+ 
+-use crate::{Database, Problem, RateLimitConfig};
++use crate::{Database, GitHubHost, Problem, RateLimitConfig};
+ use rate_limit::RateLimiter;
+ 
+ pub use limits::HttpLimits;
+@@ -31,6 +31,7 @@ pub struct HttpPlatformLayer {
+     limits: HttpLimits,
+     contract_id: Option<String>,
+     csp_script_hash: Option<String>,
++    csp_github_host: GitHubHost,
+     rate_limiter: RateLimiter,
+     secure_transport_required: bool,
+ }
+@@ -43,6 +44,7 @@ impl HttpPlatformLayer {
+             limits: HttpLimits::default(),
+             contract_id: None,
+             csp_script_hash: None,
++            csp_github_host: GitHubHost::default(),
+             rate_limiter: RateLimiter::default(),
+             secure_transport_required: false,
+         }
+@@ -66,6 +68,13 @@ impl HttpPlatformLayer {
+         self
+     }
+ 
++    /// Allows GitHub App registration forms to submit to this validated GitHub host.
++    #[must_use]
++    pub fn with_csp_github_host(mut self, host: GitHubHost) -> Self {
++        self.csp_github_host = host;
++        self
++    }
++
+     #[must_use]
+     pub fn with_rate_limits(mut self, config: RateLimitConfig) -> Self {
+         self.rate_limiter = self.rate_limiter.with_config(config);
+@@ -104,6 +113,7 @@ impl<S> Layer<S> for HttpPlatformLayer {
+             limits: self.limits,
+             contract_id: self.contract_id.clone(),
+             csp_script_hash: self.csp_script_hash.clone(),
++            csp_github_host: self.csp_github_host.clone(),
+             rate_limiter: self.rate_limiter.clone(),
+             secure_transport_required: self.secure_transport_required,
+             readiness: InnerReadiness::Checking,
+@@ -125,6 +135,7 @@ pub struct HttpPlatformService<S> {
+     limits: HttpLimits,
+     contract_id: Option<String>,
+     csp_script_hash: Option<String>,
++    csp_github_host: GitHubHost,
+     rate_limiter: RateLimiter,
+     secure_transport_required: bool,
+     readiness: InnerReadiness,
+@@ -138,6 +149,7 @@ impl<S: Clone> Clone for HttpPlatformService<S> {
+             limits: self.limits,
+             contract_id: self.contract_id.clone(),
+             csp_script_hash: self.csp_script_hash.clone(),
++            csp_github_host: self.csp_github_host.clone(),
+             rate_limiter: self.rate_limiter.clone(),
+             secure_transport_required: self.secure_transport_required,
+             readiness: InnerReadiness::Checking,
+@@ -180,6 +192,7 @@ where
+         let limits = self.limits;
+         let contract_id = self.contract_id.clone();
+         let csp_script_hash = self.csp_script_hash.clone();
++        let csp_github_host = self.csp_github_host.clone();
+         let rate_limiter = self.rate_limiter.clone();
+         let secure_transport_required = self.secure_transport_required;
+ 
+@@ -205,6 +218,7 @@ where
+                         &request_id,
+                         false,
+                         csp_script_hash.as_deref(),
++                        &csp_github_host,
+                     ));
+                 }
+             };
+@@ -222,6 +236,7 @@ where
+                     &request_id,
+                     false,
+                     csp_script_hash.as_deref(),
++                    &csp_github_host,
+                 ));
+             }
+ 
+@@ -238,6 +253,7 @@ where
+                     &request_id,
+                     transport.is_secure(),
+                     csp_script_hash.as_deref(),
++                    &csp_github_host,
+                 ));
+             }
+ 
+@@ -259,6 +275,7 @@ where
+                     &request_id,
+                     transport.is_secure(),
+                     csp_script_hash.as_deref(),
++                    &csp_github_host,
+                 ));
+             }
+ 
+@@ -290,6 +307,7 @@ where
+                         &request_id,
+                         transport.is_secure(),
+                         csp_script_hash.as_deref(),
++                        &csp_github_host,
+                     ));
+                 }
+             };
+@@ -300,6 +318,7 @@ where
+                     &request_id,
+                     transport.is_secure(),
+                     csp_script_hash.as_deref(),
++                    &csp_github_host,
+                 ));
+             }
+ 
+@@ -314,6 +333,7 @@ where
+                     &request_id,
+                     transport.is_secure(),
+                     csp_script_hash.as_deref(),
++                    &csp_github_host,
+                 ));
+             }
+ 
+@@ -352,6 +372,7 @@ where
+                             &request_id,
+                             transport.is_secure(),
+                             csp_script_hash.as_deref(),
++                            &csp_github_host,
+                         ));
+                     }
+                 },
+@@ -370,6 +391,7 @@ where
+                         &request_id,
+                         transport.is_secure(),
+                         csp_script_hash.as_deref(),
++                        &csp_github_host,
+                     ));
+                 }
+             };
+@@ -391,6 +413,7 @@ where
+                 &request_id,
+                 transport.is_secure(),
+                 csp_script_hash.as_deref(),
++                &csp_github_host,
+             ))
+         })
+     }
+@@ -454,13 +477,19 @@ fn finish_response(
+     request_id: &RequestId,
+     secure: bool,
+     csp_script_hash: Option<&str>,
++    csp_github_host: &GitHubHost,
+ ) -> AxumResponse {
+     let request_id = HeaderValue::from_str(request_id.as_str())
+         .expect("validated request IDs are valid header values");
+     response
+         .headers_mut()
+         .insert(HeaderName::from_static("x-request-id"), request_id);
+-    add_security_headers(response.headers_mut(), secure, csp_script_hash);
++    add_security_headers(
++        response.headers_mut(),
++        secure,
++        csp_script_hash,
++        csp_github_host,
++    );
+     response
+ }
+ 
+diff --git a/crates/platform/src/http/security.rs b/crates/platform/src/http/security.rs
+index fd3bd5b..e7e829a 100644
+--- a/crates/platform/src/http/security.rs
++++ b/crates/platform/src/http/security.rs
+@@ -2,13 +2,14 @@ use std::collections::BTreeSet;
+ use std::net::{IpAddr, Ipv4Addr};
+ 
+ use axum::http::header::{
+-    HeaderName, HeaderValue, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
++    CONTENT_SECURITY_POLICY, HeaderName, HeaderValue, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+     X_FRAME_OPTIONS,
+ };
+ use axum::http::{HeaderMap, Method, Uri};
+ use ipnet::IpNet;
+ 
+ use super::RequestId;
++use crate::GitHubHost;
+ 
+ const X_FORWARDED_FOR: &str = "x-forwarded-for";
+ const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
+@@ -280,6 +281,7 @@ pub(crate) fn add_security_headers(
+     headers: &mut HeaderMap,
+     secure: bool,
+     csp_script_hash: Option<&str>,
++    github_host: &GitHubHost,
+ ) {
+     let script_source = csp_script_hash
+         .map(|hash| format!("script-src 'self' '{hash}'; "))
+@@ -288,8 +290,9 @@ pub(crate) fn add_security_headers(
+     // plugin creates and then fills through the CSSOM (`insertRule`), which CSP does not restrict.
+     // `frame-src` `blob:` is the PDF preview (the file URL itself cannot be framed). Vimeo joins YouTube.
+     // `media-src` `https:` lets a document play an audio or video file the page links to.
++    let github_origin = github_host.web_origin();
+     let policy = format!(
+-        "default-src 'self'; {script_source}style-src 'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='; style-src-attr 'unsafe-inline'; img-src 'self' data: blob: https:; frame-src blob: https://www.youtube-nocookie.com https://player.vimeo.com; media-src 'self' https:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self' https://github.com"
++        "default-src 'self'; {script_source}style-src 'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='; style-src-attr 'unsafe-inline'; img-src 'self' data: blob: https:; frame-src blob: https://www.youtube-nocookie.com https://player.vimeo.com; media-src 'self' https:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self' {github_origin}"
+     );
+     headers.insert(
+         CONTENT_SECURITY_POLICY,
+@@ -343,12 +346,12 @@ mod tests {
+     use axum::http::header::{AUTHORIZATION, COOKIE, ORIGIN, UPGRADE};
+     use axum::http::{HeaderMap, Method, Uri};
+ 
+-    use super::{add_security_headers, bearer_token, OriginPolicy};
++    use super::{OriginPolicy, add_security_headers, bearer_token};
+ 
+     #[test]
+     fn responses_refuse_framing_and_isolate_the_opener() {
+         let mut headers = HeaderMap::new();
+-        add_security_headers(&mut headers, true, None);
++        add_security_headers(&mut headers, true, None, &crate::GitHubHost::default());
+         assert_eq!(headers["x-frame-options"], "DENY");
+         assert_eq!(headers["cross-origin-opener-policy"], "same-origin");
+     }
+diff --git a/crates/platform/src/lib.rs b/crates/platform/src/lib.rs
+index 1f30ec2..2e5a0e9 100644
+--- a/crates/platform/src/lib.rs
++++ b/crates/platform/src/lib.rs
+@@ -5,6 +5,7 @@ mod backup;
+ mod config;
+ mod db;
+ mod files;
++mod github;
+ mod health;
+ mod http;
+ mod id;
+@@ -48,6 +49,7 @@ pub use files::{
+     UploadFinalization, UploadLimitError, UploadLimits, UploadService, WORKSPACE_STORAGE_USED,
+     WorkspaceBucket,
+ };
++pub use github::{GitHubHost, GitHubHostKind, InvalidGitHubHost};
+ pub use health::{HealthCheck, HealthCheckResult, HealthRegistry, ReadinessReport};
+ pub use http::{
+     ClientIp, HttpLimits, HttpPlatformLayer, OriginPolicy, RequestId, RequestTransport,
+diff --git a/crates/platform/tests/backup.rs b/crates/platform/tests/backup.rs
+index 50bb6a1..4a2f417 100644
+--- a/crates/platform/tests/backup.rs
++++ b/crates/platform/tests/backup.rs
+@@ -123,7 +123,7 @@ async fn postgres_restore_replaces_the_database_and_attachments() {
+     assert_eq!(initialized, 1);
+     let migrations: i64 = fixture
+         .database
+-        .scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 77")
++        .scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 78")
+         .await
+         .unwrap();
+     assert_eq!(migrations, 1);
+@@ -230,7 +230,7 @@ async fn snapshot_manifest_checksums_the_database_and_attachment() {
+     let snapshot = fixture.service.create(&fixture.database).await.unwrap();
+ 
+     assert_eq!(snapshot.manifest.kind, BackupKind::Snapshot);
+-    assert_eq!(snapshot.manifest.schema_version, 77);
++    assert_eq!(snapshot.manifest.schema_version, 78);
+     assert_eq!(
+         snapshot.manifest.application_version,
+         env!("CARGO_PKG_VERSION")
+diff --git a/crates/platform/tests/database.rs b/crates/platform/tests/database.rs
+index f533d56..432687f 100644
+--- a/crates/platform/tests/database.rs
++++ b/crates/platform/tests/database.rs
+@@ -5,6 +5,7 @@ use orbit_platform::{
+     MigrationRunner, TestDatabase,
+ };
+ 
++#[cfg(unix)]
+ const OWNERSHIP_CHILD_PATH: &str = "ORBIT_TEST_OWNERSHIP_CHILD_PATH";
+ static PROCESS_OWNERSHIP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+ 
+@@ -113,7 +114,7 @@ async fn github_schema_is_in_one_draft_migration() {
+         db.scalar::<i64>("SELECT MAX(version) FROM schema_migrations")
+             .await
+             .unwrap(),
+-        77
++        78
+     );
+     assert_eq!(
+         db.scalar::<i64>("SELECT COUNT(*) FROM pragma_table_info('github_issue_links') WHERE name IN ('kind', 'pull_state', 'sync_paused')")
+@@ -250,7 +251,7 @@ async fn rejects_a_schema_newer_than_the_binary() {
+         error,
+         MigrationError::SchemaNewer {
+             database_version: 999,
+-            binary_version: 77
++            binary_version: 78
+         }
+     ));
+ }
+diff --git a/crates/platform/tests/files.rs b/crates/platform/tests/files.rs
+index 6eeeca6..c5435d2 100644
+--- a/crates/platform/tests/files.rs
++++ b/crates/platform/tests/files.rs
+@@ -1,7 +1,7 @@
+ use std::io;
+ use std::pin::Pin;
+-use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::task::{Context, Poll};
+ 
+ use orbit_platform::{
+@@ -130,13 +130,15 @@ async fn stage_sniffs_bytes_and_never_uses_a_client_path_as_a_filesystem_path()
+     assert_eq!(png.detected_media_type, "image/png");
+     assert_eq!(png.display_name, "picture.png");
+     assert_eq!(png.sha256.len(), 64);
+-    assert!(fixture
+-        .store
+-        .temporary_files()
+-        .await
+-        .unwrap()
+-        .iter()
+-        .all(|file| file.path.starts_with(fixture.store.root())));
++    assert!(
++        fixture
++            .store
++            .temporary_files()
++            .await
++            .unwrap()
++            .iter()
++            .all(|file| file.path.starts_with(fixture.store.root()))
++    );
+ 
+     let svg = fixture
+         .service
+@@ -170,11 +172,13 @@ async fn finalize_deduplicates_only_inside_a_workspace_and_atomically_installs_t
+         .await
+         .unwrap();
+     assert!(!first_temp.exists());
+-    assert!(fixture
+-        .store
+-        .path(&first_blob.storage_key)
+-        .unwrap()
+-        .exists());
++    assert!(
++        fixture
++            .store
++            .path(&first_blob.storage_key)
++            .unwrap()
++            .exists()
++    );
+ 
+     let duplicate = fixture
+         .service
+@@ -406,11 +410,13 @@ async fn failed_deduplicated_finalization_restarts_the_orphan_quarantine() {
+         .await
+         .unwrap();
+     assert_eq!(result.deleted_blobs, 0);
+-    assert!(fixture
+-        .store
+-        .path(&orphan_blob.storage_key)
+-        .unwrap()
+-        .exists());
++    assert!(
++        fixture
++            .store
++            .path(&orphan_blob.storage_key)
++            .unwrap()
++            .exists()
++    );
+ }
+ 
+ #[tokio::test]
+@@ -871,11 +877,13 @@ async fn reconciliation_rechecks_quarantine_after_a_concurrent_failed_deduplicat
+     let result = reconcile.await.unwrap().unwrap();
+ 
+     assert_eq!(result.deleted_blobs, 0);
+-    assert!(fixture
+-        .store
+-        .path(&orphan_blob.storage_key)
+-        .unwrap()
+-        .exists());
++    assert!(
++        fixture
++            .store
++            .path(&orphan_blob.storage_key)
++            .unwrap()
++            .exists()
++    );
+ }
+ 
+ #[tokio::test]
+diff --git a/crates/platform/tests/http_security.rs b/crates/platform/tests/http_security.rs
+index 87692a1..024c826 100644
+--- a/crates/platform/tests/http_security.rs
++++ b/crates/platform/tests/http_security.rs
+@@ -2,11 +2,11 @@ use std::future::Ready;
+ use std::io;
+ use std::net::{Ipv4Addr, SocketAddr};
+ use std::str::FromStr;
+-use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::task::{Context, Poll, Waker};
+ 
+-use axum::body::{to_bytes, Body};
++use axum::body::{Body, to_bytes};
+ use axum::extract::ConnectInfo;
+ use axum::http::header::{CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE};
+ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+@@ -18,7 +18,7 @@ use orbit_platform::{
+     RateLimitConfig, RequestId, RequestTransport,
+ };
+ use serde_json::Value;
+-use tower::{service_fn, Layer, Service, ServiceExt};
++use tower::{Layer, Service, ServiceExt, service_fn};
+ 
+ #[derive(Clone)]
+ struct PendingService;
+@@ -134,9 +134,11 @@ async fn unsafe_requests_reject_foreign_and_missing_origins_as_problem_details()
+         assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+         let problem = body_json(response).await;
+         assert_eq!(problem["code"], "origin_forbidden");
+-        assert!(problem["request_id"]
+-            .as_str()
+-            .is_some_and(|id| !id.is_empty()));
++        assert!(
++            problem["request_id"]
++                .as_str()
++                .is_some_and(|id| !id.is_empty())
++        );
+     }
+ }
+ 
+@@ -312,10 +314,12 @@ async fn untrusted_forwarded_headers_are_ignored_and_a_uuid_v7_request_id_is_gen
+         .to_owned();
+     assert_ne!(response_id, "upstream-id");
+     assert!(Id::from_str(&response_id).is_ok());
+-    assert!(response
+-        .headers()
+-        .get("strict-transport-security")
+-        .is_none());
++    assert!(
++        response
++            .headers()
++            .get("strict-transport-security")
++            .is_none()
++    );
+     let body = body_json(response).await;
+     assert_eq!(body["request_id"], response_id);
+     assert_eq!(body["client_ip"], "192.0.2.10");
+@@ -509,9 +513,11 @@ async fn forwarded_chain_cannot_spoof_an_address_before_the_nearest_untrusted_ho
+     let response = app.oneshot(request).await.unwrap();
+     let body = to_bytes(response.into_body(), 1024).await.unwrap();
+ 
+-    assert!(String::from_utf8(body.to_vec())
+-        .unwrap()
+-        .ends_with("|203.0.113.9"));
++    assert!(
++        String::from_utf8(body.to_vec())
++            .unwrap()
++            .ends_with("|203.0.113.9")
++    );
+ }
+ 
+ #[tokio::test]
+@@ -839,6 +845,30 @@ async fn csp_allows_only_the_verified_bootstrap_hash_and_local_image_variants()
+     );
+ }
+ 
++#[tokio::test]
++async fn csp_form_action_uses_only_the_configured_github_web_origin() {
++    for origin in ["https://acme.ghe.com", "https://github.example:8443"] {
++        let app = Router::new()
++            .route("/", get(|| async { StatusCode::OK }))
++            .layer(
++                HttpPlatformLayer::new(OriginPolicy::new("https://orbit.test"))
++                    .with_csp_github_host(origin.parse().unwrap()),
++            );
++        for (method, status) in [("GET", StatusCode::OK), ("POST", StatusCode::FORBIDDEN)] {
++            let response = app.clone().oneshot(request(method, "/")).await.unwrap();
++            assert_eq!(response.status(), status);
++            let csp = response.headers()[CONTENT_SECURITY_POLICY]
++                .to_str()
++                .unwrap();
++            let form_action = csp
++                .split(';')
++                .find(|d| d.trim().starts_with("form-action "))
++                .unwrap();
++            assert_eq!(form_action.trim(), format!("form-action 'self' {origin}"));
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn production_boundary_rejects_requests_without_verified_https_transport() {
+     let app = Router::new()
+diff --git a/deploy/.env.example b/deploy/.env.example
+index 1ba5ce9..fe152bb 100644
+--- a/deploy/.env.example
++++ b/deploy/.env.example
+@@ -2,5 +2,7 @@ ORBIT_DOMAIN=orbit.example.com
+ # Required. Create it with `openssl rand -base64 32` and keep a copy outside this server:
+ # without it, Orbit cannot read the secrets it saved (SMTP password, S3 secret, GitHub App keys, 2FA).
+ ORBIT_APP_KEY=
++# Optional GitHub web origin (default: https://github.com). See docs/github.md before changing it.
++# ORBIT_GITHUB_URL=https://github.example.com
+ # To deploy a published release, set this and use `up -d --no-build`:
+ # ORBIT_IMAGE=ghcr.io/OWNER/REPOSITORY:v0.1.0
+diff --git a/deploy/README.md b/deploy/README.md
+index 59c9855..ccedae7 100644
+--- a/deploy/README.md
++++ b/deploy/README.md
+@@ -12,6 +12,8 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
+ 
+ Orbit reads its configuration only from `ORBIT_*` environment variables. The image sets production mode, the bind address and the data paths. A container also needs `ORBIT_PUBLIC_ORIGIN`, `ORBIT_APP_KEY` and `ORBIT_TRUSTED_PROXIES`: Orbit does not start in production without them. Set `ORBIT_TRUSTED_PROXIES` to the reverse proxy addresses plus `127.0.0.1/32` for the image healthcheck (`deploy/compose.yaml` uses `127.0.0.1/32,172.30.0.2/32`). Orbit reads the client IP address and `https` from forwarding headers only on connections from these addresses. Do not use `0.0.0.0/0` or `::/0`: then anyone who reaches port 8080 can fake their address (and get around rate limits) and HTTPS, and Orbit logs a warning at startup. To use Postgres, also set `ORBIT_DATABASE_URL`. Keep a copy of `ORBIT_APP_KEY` outside the server: without it, Orbit cannot read the secrets it saved. For all variables, see [Configuration](../docs/operations.md#configuration).
+ 
++To use a GitHub host other than github.com, set `ORBIT_GITHUB_URL` in `deploy/.env` before starting Orbit; Compose forwards it to the container. Recreate the container with `docker compose --env-file deploy/.env -f deploy/compose.yaml up -d` after changing the file. The database is bound to one host, and changing hosts is unsupported. See [GitHub integration](../docs/github.md#github-host) before choosing a host.
++
+ The application port is not published. Only Caddy can reach it through the deployment network. Caddy forwards WebSocket upgrades automatically. The application runs as UID 65532 with a read-only root filesystem and separate named volumes for SQLite/attachments and backups.
+ 
+ On first startup, retrieve the one-time setup URL locally:
+diff --git a/deploy/compose.yaml b/deploy/compose.yaml
+index f6977fb..8767cf5 100644
+--- a/deploy/compose.yaml
++++ b/deploy/compose.yaml
+@@ -15,6 +15,7 @@ services:
+       # Caddy, and loopback for the image healthcheck.
+       ORBIT_TRUSTED_PROXIES: 127.0.0.1/32,172.30.0.2/32
+       ORBIT_APP_KEY: ${ORBIT_APP_KEY:?Set ORBIT_APP_KEY in deploy/.env}
++      ORBIT_GITHUB_URL: ${ORBIT_GITHUB_URL:-https://github.com}
+     volumes:
+       - orbit-data:/var/lib/orbit
+       - orbit-backups:/var/backups/orbit
+diff --git a/docs/github.md b/docs/github.md
+index 2b5b850..05654cf 100644
+--- a/docs/github.md
++++ b/docs/github.md
+@@ -2,18 +2,34 @@
+ 
+ Orbit uses one GitHub App per workspace. Workspace owners and admins start App registration in workspace settings. GitHub returns the App credentials to Orbit. Orbit saves the App ID and encrypts the private key and webhook secret in its database. Each project then selects an installed repository and an issue label. No repository webhook and no Orbit API token are needed.
+ 
++## GitHub host
++
++`ORBIT_GITHUB_URL` selects one GitHub web origin for the entire installation, including GitHub sign-in and workspace Apps. It defaults to `https://github.com`. Set it before first startup to an HTTPS origin without credentials, a path, query or fragment; an optional port is allowed. Orbit detects the host and derives its endpoints:
++
++| Web origin | REST API base | GraphQL endpoint |
++|---|---|---|
++| `https://github.com` | `https://api.github.com` | `https://api.github.com/graphql` |
++| `https://acme.ghe.com` (GitHub Enterprise Cloud with data residency) | `https://api.acme.ghe.com` | `https://api.acme.ghe.com/graphql` |
++| `https://github.example.com` (GitHub Enterprise Server) | `https://github.example.com/api/v3` | `https://github.example.com/api/graphql` |
++
++For `ghe.com`, exactly one subdomain is required. Other hosts are treated as GitHub Enterprise Server; a non-default port is retained for its endpoints and for the Enterprise Cloud API. OAuth authorization and token URLs, App registration and installation links use the selected web origin. There is no separate API URL override.
++
++The Orbit server must reach the chosen web and API hosts over HTTPS, and browsers must reach the web host. The GitHub host must reach Orbit's public HTTPS webhook and callback URLs. Configure DNS, firewalls and trusted TLS certificates accordingly; private Enterprise Server deployments need connectivity in both directions. GitHub Enterprise Server and Enterprise Cloud have not been tested against real services.
++
++The database binds to one GitHub host. Existing databases with GitHub records are bound to `https://github.com`; a configured host that does not match prevents startup. Restore the matching setting if this happens. Changing hosts or migrating existing GitHub connections and identities to another host is not supported. Before using an alternate host, stop every old server sharing the database and upgrade it to a version that enforces the binding. Old binaries ignore the binding lock, so a rolling upgrade cannot protect against an old server writing GitHub data for another host.
++
+ ## Server setup
+ 
+ 1. Give Orbit a public HTTPS URL that serves both the UI and `/api/v1/integrations/github/webhook` to GitHub. In production, set the server's canonical `ORBIT_PUBLIC_ORIGIN=https://orbit.example.com`. For local testing, use a public HTTPS tunnel to the Orbit web server with its `/api` proxy; Orbit uses the HTTPS domain open in your browser when you start App registration.
+ 2. Generate a 32-byte key with `openssl rand -base64 32`. Store it as `ORBIT_APP_KEY`, or put it in a file and set `ORBIT_APP_KEY_FILE` to the file path. Keep this key outside the database and its backups. Orbit cannot verify webhooks or use the saved App credentials if the key is lost.
+-3. Restart Orbit. Do not set `GITHUB_CONNECTIONS` or the older `GITHUB_*` connection variables; Orbit no longer reads them.
++3. Set `ORBIT_GITHUB_URL` if needed as described above, then restart Orbit. Do not set `GITHUB_CONNECTIONS` or the older `GITHUB_*` connection variables; Orbit no longer reads them.
+ 
+ For local development, `just dev` also loads a root `.env.local` file. Put `ORBIT_APP_KEY=<base64-key>` there. Keep the file private and out of Git. Open Orbit through a public HTTPS tunnel to the web server before you select **Register GitHub App**. You do not need to set `ORBIT_PUBLIC_ORIGIN` to the tunnel URL for this development flow. A plain `http://127.0.0.1` tab cannot register a GitHub App.
+ 
+ ## Register the workspace App and connect a project
+ 
+ 1. Open **Settings → GitHub** as a workspace owner or admin.
+-2. Enter a GitHub organization name if the organization should own the App, or leave it blank for a personal App. Select **Register GitHub App**. Orbit sends a private App manifest to GitHub; only the App owner can install it. Approve the registration on GitHub. GitHub sends a one-time code to Orbit, and Orbit stores the App credentials. This needs a reachable HTTPS origin.
++2. Enter a GitHub organization name if the organization should own the App, or leave it blank for a personal App. Select **Register GitHub App**. Register and approve it on the chosen GitHub host. Orbit sends a private App manifest to GitHub; only the App owner can install it. GitHub sends a one-time code to Orbit, and Orbit stores the App credentials. This needs a reachable HTTPS origin.
+ 3. Select **Install or change repositories** in workspace settings. Install the App on the GitHub account and select the repositories. GitHub sends installation events to Orbit.
+ 4. Open **Tasks → Project settings → GitHub** and refresh after installation. Select a repository and enter a GitHub label, then save. Create the same label in GitHub. You can connect more projects to the same repository if each project uses a different label. A project has one repository connection.
+ 5. Add that label to an issue or pull request. Orbit creates one task in the selected project. Later GitHub edits update its title and body; close and reopen events update its status. A merged pull request completes its task. A pull request closed without a merge cancels its task. Reopening it moves the task to unstarted. Removing the label pauses updates, keeps the task, and shows a **GitHub sync paused** badge. Adding the label again resumes updates on the same task. Do not put two configured project labels on one issue or pull request.
+diff --git a/docs/operations.md b/docs/operations.md
+index 17973d0..5a6ea30 100644
+--- a/docs/operations.md
++++ b/docs/operations.md
+@@ -29,6 +29,7 @@ Orbit reads its configuration only from environment variables that start with `O
+ | `ORBIT_RATE_LIMIT_*` | see notes | Request limits and email caps. See [Request limits and email caps](#request-limits-and-email-caps). |
+ | `ORBIT_APP_KEY` | none | **Required.** The key for saved secrets: base64 of 32 random bytes. |
+ | `ORBIT_APP_KEY_FILE` | none | The path of a file that contains the app key, instead of `ORBIT_APP_KEY`. Do not set both. |
++| `ORBIT_GITHUB_URL` | `https://github.com` | GitHub HTTPS web origin for sign-in and Apps. The database binds to one host; changing hosts is unsupported. See [GitHub host](github.md#github-host). |
+ | `ORBIT_CLOUD` | `false` | `true` turns on Stripe billing for Orbit Cloud and requires the three Stripe variables below. See [Billing (Orbit Cloud)](#billing-orbit-cloud). |
+ | `ORBIT_STRIPE_SECRET_KEY` | none | The Stripe secret key (`sk_live_…`, or `sk_test_…` for test mode). Only with `ORBIT_CLOUD=true`. |
+ | `ORBIT_STRIPE_SECRET_KEY_FILE` | none | The path of a file that contains the Stripe secret key, instead of `ORBIT_STRIPE_SECRET_KEY`. Do not set both. |
+@@ -145,7 +146,7 @@ To create the Google client:
+ 
+ To create the GitHub client:
+ 
+-1. Open GitHub **Settings → Developer settings → OAuth Apps → New OAuth App**. For an organization, use the organization settings.
++1. On the host selected by `ORBIT_GITHUB_URL`, open GitHub **Settings → Developer settings → OAuth Apps → New OAuth App**. For an organization, use the organization settings. See [GitHub host](github.md#github-host) for connectivity and host-binding requirements.
+ 2. Set **Homepage URL** to the public origin. Set **Authorization callback URL** to the GitHub callback URL.
+ 3. Register the app. Generate a client secret.
+ 4. Copy the client ID and the client secret.
+@@ -226,7 +227,7 @@ A request, a live socket or a co-editing socket can go to any server; sticky ses
+ ### Deployment
+ 
+ - **Postgres:** one database with failover (a managed service, or Patroni). Connect directly or through a pooler in session mode: Orbit uses advisory locks and `LISTEN`/`NOTIFY`, which a pooler in transaction mode (PgBouncer `pool_mode = transaction`) breaks. Give each server its share of `max_connections` (each server uses its pools plus two connections: the ownership lock and the cluster listener).
+-- **Configuration on every server:** the same `ORBIT_DATABASE_URL`, `ORBIT_APP_KEY` and `ORBIT_PUBLIC_ORIGIN`. `ORBIT_TRUSTED_PROXIES` holds the load balancer addresses.
++- **Configuration on every server:** the same `ORBIT_DATABASE_URL`, `ORBIT_APP_KEY`, `ORBIT_PUBLIC_ORIGIN` and `ORBIT_GITHUB_URL`. `ORBIT_TRUSTED_PROXIES` holds the load balancer addresses. Before using a non-default GitHub host, stop every old server sharing the database and upgrade it: older binaries ignore the host-binding lock, so a rolling upgrade cannot protect against their writes. See [GitHub host](github.md#github-host).
+ - **Storage:** save a bucket in **Admin → Storage** and turn on attachments and backups in S3 before the second server starts. The local disk of a server then holds only temporary files (upload staging, backup downloads), so it can be an ephemeral volume. While other servers run, Orbit refuses to move attachments back to local disks (409 `storage_shared`), and a server that hears other servers while attachments are local logs a warning.
+ - **Load balancer:** check `/health/ready` and remove a server on 503. Keep WebSockets open for a long time (idle timeout of 1 hour or more) for `/api/v1/workspaces/{id}/events`, the live socket (`/api/v1/workspaces/{id}/live`) and the co-editing socket of a page.
+ - **Stopping a server:** set `ORBIT_SHUTDOWN_DELAY_SECONDS` (0 to 300, default 0) to a little more than the load balancer's health check interval. After SIGTERM, `/health/ready` reports 503 (`accepting`) at once and the server still serves for that long, then drains for up to 30 s. Give the orchestrator a stop timeout of at least the delay plus 30 s.
+-- 
+2.56.0.windows.4
+
