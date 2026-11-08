@@ -83,17 +83,20 @@ async fn registration_manifest_respects_workspace_sync_mode() {
         let result: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(
-            result["manifest"],
-            json!({
-                "name": "Orbit", "url": "https://orbit.test",
-                "hook_attributes": {"url": "https://orbit.test/api/v1/integrations/github/webhook", "active": mode != Some("polling")},
-                "redirect_url": "https://orbit.test/api/v1/integrations/github/manifest/callback",
-                "setup_url": format!("https://orbit.test/settings/github?workspace={}&github=installed", setup.workspace_id),
-                "public": false, "default_permissions": {"issues": "read", "pull_requests": "read"},
-                "default_events": ["issues", "pull_request"]
-            })
-        );
+        let mut expected = json!({
+            "name": "Orbit", "url": "https://orbit.test",
+            "redirect_url": "https://orbit.test/api/v1/integrations/github/manifest/callback",
+            "setup_url": format!("https://orbit.test/settings/github?workspace={}&github=installed", setup.workspace_id),
+            "public": false, "default_permissions": {"issues": "read", "pull_requests": "read"},
+            "default_events": ["issues", "pull_request"]
+        });
+        if mode != Some("polling") {
+            expected["hook_attributes"] = json!({
+                "url": "https://orbit.test/api/v1/integrations/github/webhook",
+                "active": true
+            });
+        }
+        assert_eq!(result["manifest"], expected);
         let stored: Option<String> = sqlx::query_scalar(
             "SELECT sync_mode FROM github_workspace_settings WHERE workspace_id = $1",
         )
