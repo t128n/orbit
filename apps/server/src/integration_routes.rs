@@ -848,6 +848,24 @@ pub(crate) async fn start_github_manifest(
          .bind(hash.to_vec()).bind(&workspace).bind(TimestampMillis::now().as_millis() + 3_600_000).bind(&origin)
         .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
     tx.commit().await.map_err(|_| ApiError::internal(id))?;
+    // GitHub rejects a webhook URL that is not reachable over the public Internet, including
+    // localhost. Polling does not use webhooks, so register the App without one.
+    let polling = sync_mode.as_deref() == Some("polling");
+    let mut manifest = serde_json::json!({
+        "name": "Orbit",
+        "url": origin.clone(),
+        "redirect_url": format!("{origin}/api/v1/integrations/github/manifest/callback"),
+        "setup_url": format!("{origin}/settings/github?workspace={workspace}&github=installed"),
+        "public": false,
+        "default_permissions": { "issues": "read", "pull_requests": "read" },
+        "default_events": ["issues", "pull_request"]
+    });
+    if !polling {
+        manifest["hook_attributes"] = serde_json::json!({
+            "url": format!("{origin}/api/v1/integrations/github/webhook"),
+            "active": true
+        });
+    }
     Ok(Json(GithubManifestStart {
         action: format!(
             "{}?state={token}",
@@ -855,16 +873,7 @@ pub(crate) async fn start_github_manifest(
                 .github_host
                 .manifest_url((!organization.is_empty()).then_some(organization))
         ),
-        manifest: serde_json::json!({
-            "name": "Orbit",
-            "url": origin,
-            "hook_attributes": { "url": format!("{origin}/api/v1/integrations/github/webhook"), "active": sync_mode.as_deref() != Some("polling") },
-            "redirect_url": format!("{origin}/api/v1/integrations/github/manifest/callback"),
-            "setup_url": format!("{origin}/settings/github?workspace={workspace}&github=installed"),
-            "public": false,
-            "default_permissions": { "issues": "read", "pull_requests": "read" },
-            "default_events": ["issues", "pull_request"]
-        }),
+        manifest,
     }))
 }
 
@@ -873,7 +882,7 @@ struct GithubManifestConversion {
     id: i64,
     slug: String,
     pem: String,
-    webhook_secret: String,
+    webhook_secret: Option<String>,
 }
 
 #[utoipa::path(get, path = "/api/v1/integrations/github/manifest/callback", params(("code" = String, Query), ("state" = String, Query)), responses((status = 303, description = "Return to workspace settings")))]
@@ -986,12 +995,14 @@ async fn store_github_app(
     app: &GithubManifestConversion,
     id: Option<&RequestId>,
 ) -> Result<(), ApiError> {
-    if app.id <= 0 || app.slug.is_empty() || app.pem.is_empty() || app.webhook_secret.is_empty() {
+    if app.id <= 0 || app.slug.is_empty() || app.pem.is_empty() {
         return Err(ApiError::internal(id));
     }
     let pem = encrypt_github_secret(key, &app.pem).map_err(|_| ApiError::internal(id))?;
-    let secret =
-        encrypt_github_secret(key, &app.webhook_secret).map_err(|_| ApiError::internal(id))?;
+    // An App registered for polling has no webhook and GitHub returns no webhook secret.
+    // Store an encrypted empty value so every saved secret remains readable.
+    let secret = encrypt_github_secret(key, app.webhook_secret.as_deref().unwrap_or(""))
+        .map_err(|_| ApiError::internal(id))?;
     let mut tx = state
         .tasks
         .database()
@@ -2075,7 +2086,7 @@ mod tests {
             id: 77,
             slug: "orbit-test".to_owned(),
             pem: "private-key".to_owned(),
-            webhook_secret: "hook-secret".to_owned(),
+            webhook_secret: Some("hook-secret".to_owned()),
         };
         assert!(
             store_github_app(

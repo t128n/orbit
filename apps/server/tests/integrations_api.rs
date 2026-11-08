@@ -1328,7 +1328,7 @@ async fn development_github_registration_uses_the_browser_origin() {
     assert_eq!(local.status(), StatusCode::OK);
     let manifest = response_json(local).await["manifest"].clone();
     assert_eq!(manifest["url"], "http://127.0.0.1:18888");
-    assert_eq!(manifest["hook_attributes"]["active"], false);
+    assert!(manifest.get("hook_attributes").is_none());
     assert_eq!(
         manifest["redirect_url"],
         "http://127.0.0.1:18888/api/v1/integrations/github/manifest/callback"
@@ -1350,6 +1350,7 @@ async fn development_github_registration_uses_the_browser_origin() {
     assert_eq!(remote_http.status(), StatusCode::OK);
     let manifest = response_json(remote_http).await["manifest"].clone();
     assert_eq!(manifest["url"], "http://example.com");
+    assert!(manifest.get("hook_attributes").is_none());
     assert_eq!(
         manifest["redirect_url"],
         "http://example.com/api/v1/integrations/github/manifest/callback"
@@ -1370,10 +1371,7 @@ async fn development_github_registration_uses_the_browser_origin() {
     assert_eq!(registered.status(), StatusCode::OK);
     let manifest = response_json(registered).await["manifest"].clone();
     assert_eq!(manifest["url"], "https://orbit-tunnel.example");
-    assert_eq!(
-        manifest["hook_attributes"]["url"],
-        "https://orbit-tunnel.example/api/v1/integrations/github/webhook"
-    );
+    assert!(manifest.get("hook_attributes").is_none());
     assert_eq!(
         manifest["redirect_url"],
         "https://orbit-tunnel.example/api/v1/integrations/github/manifest/callback"
