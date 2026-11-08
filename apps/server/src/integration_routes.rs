@@ -849,7 +849,7 @@ pub(crate) async fn start_github_manifest(
         .execute(&mut *tx).await.map_err(|_| ApiError::internal(id))?;
     tx.commit().await.map_err(|_| ApiError::internal(id))?;
     // GitHub rejects a webhook URL that is not reachable over the public Internet, including
-    // localhost. Polling does not use webhooks, so register the App without one.
+    // localhost, and rejects requested events without a webhook URL. Polling uses neither.
     let polling = sync_mode.as_deref() == Some("polling");
     let mut manifest = serde_json::json!({
         "name": "Orbit",
@@ -858,7 +858,7 @@ pub(crate) async fn start_github_manifest(
         "setup_url": format!("{origin}/settings/github?workspace={workspace}&github=installed"),
         "public": false,
         "default_permissions": { "issues": "read", "pull_requests": "read" },
-        "default_events": ["issues", "pull_request"]
+        "default_events": if polling { serde_json::json!([]) } else { serde_json::json!(["issues", "pull_request"]) }
     });
     if !polling {
         manifest["hook_attributes"] = serde_json::json!({

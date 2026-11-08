@@ -88,7 +88,7 @@ async fn registration_manifest_respects_workspace_sync_mode() {
             "redirect_url": "https://orbit.test/api/v1/integrations/github/manifest/callback",
             "setup_url": format!("https://orbit.test/settings/github?workspace={}&github=installed", setup.workspace_id),
             "public": false, "default_permissions": {"issues": "read", "pull_requests": "read"},
-            "default_events": ["issues", "pull_request"]
+            "default_events": if mode == Some("polling") { json!([]) } else { json!(["issues", "pull_request"]) }
         });
         if mode != Some("polling") {
             expected["hook_attributes"] = json!({
