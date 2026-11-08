@@ -48,7 +48,7 @@ GitHub App registration uses the [GitHub App manifest flow](https://docs.github.
 
 The setup above describes the default webhook integration. A workspace-level polling mode is available for Orbit instances that are accessible to users over private HTTPS but cannot receive inbound GitHub webhooks. The browser must be able to reach Orbit for registration and the callback. In Development, any HTTP origin is accepted when polling is active.
 
-In polling mode, the App manifest has no webhook, so GitHub does not validate that Orbit is reachable over the public Internet. Orbit discovers App installations and repository access through outbound GitHub API requests rather than installation events. Workspace owners and admins can choose a polling interval from 1 to 15 minutes, with a default of 5 minutes. Shorter intervals reduce synchronization latency but consume more GitHub API quota; longer intervals conserve quota but delay updates.
+In polling mode, the App manifest has no webhook and requests no events, so GitHub does not validate that Orbit is reachable over the public Internet. Orbit discovers App installations and repository access through outbound GitHub API requests rather than installation events. Workspace owners and admins can choose a polling interval from 1 to 15 minutes, with a default of 5 minutes. Shorter intervals reduce synchronization latency but consume more GitHub API quota; longer intervals conserve quota but delay updates.
 
 Polling remains one-way: Orbit does not write task changes back to GitHub. A successful, complete poll can pause sync for an item whose project label was removed, retaining its task so adding the label again can resume it. Failed or incomplete polls must not be treated as proof that a label was removed.
 
