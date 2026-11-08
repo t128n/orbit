@@ -16,6 +16,9 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn registration_manifest_respects_workspace_sync_mode() {
     let database = TestDatabase::new().await.unwrap();
+    orbit_server::github_binding::bind(&database, &orbit_platform::GitHubHost::default())
+        .await
+        .unwrap();
     let identity = IdentityRepository::new((*database).clone());
     let now = TimestampMillis::now();
     identity
