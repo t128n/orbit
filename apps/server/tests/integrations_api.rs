@@ -1274,7 +1274,7 @@ async fn database_github_app_routes_issues_without_orbit_tokens() {
 }
 
 #[tokio::test]
-async fn development_github_registration_uses_the_browser_https_origin() {
+async fn development_github_registration_uses_the_browser_origin() {
     let fixture = fixture().await;
     let state = IntegrationState::new(
         Arc::new(fixture.tokens.clone()),
@@ -1310,6 +1310,58 @@ async fn development_github_registration_uses_the_browser_https_origin() {
         .await
         .unwrap();
     assert_eq!(insecure.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Polling does not need an inbound webhook, so any browser HTTP origin can
+    // register the App without a public HTTPS URL while in Development.
+    sqlx::query(
+        "INSERT INTO github_workspace_settings (workspace_id, sync_mode) VALUES ($1, 'polling')",
+    )
+    .bind(fixture.workspace_id.to_string())
+    .execute(fixture.database.pool())
+    .await
+    .unwrap();
+    let local = app
+        .clone()
+        .oneshot(request("http://127.0.0.1:18888"))
+        .await
+        .unwrap();
+    assert_eq!(local.status(), StatusCode::OK);
+    let manifest = response_json(local).await["manifest"].clone();
+    assert_eq!(manifest["url"], "http://127.0.0.1:18888");
+    assert_eq!(manifest["hook_attributes"]["active"], false);
+    assert_eq!(
+        manifest["redirect_url"],
+        "http://127.0.0.1:18888/api/v1/integrations/github/manifest/callback"
+    );
+    let saved_origin: String = sqlx::query_scalar(
+        "SELECT public_origin FROM github_app_registrations WHERE workspace_id = $1",
+    )
+    .bind(fixture.workspace_id.to_string())
+    .fetch_one(fixture.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(saved_origin, "http://127.0.0.1:18888");
+
+    let remote_http = app
+        .clone()
+        .oneshot(request("http://example.com"))
+        .await
+        .unwrap();
+    assert_eq!(remote_http.status(), StatusCode::OK);
+    let manifest = response_json(remote_http).await["manifest"].clone();
+    assert_eq!(manifest["url"], "http://example.com");
+    assert_eq!(
+        manifest["redirect_url"],
+        "http://example.com/api/v1/integrations/github/manifest/callback"
+    );
+    let saved_origin: String = sqlx::query_scalar(
+        "SELECT public_origin FROM github_app_registrations WHERE workspace_id = $1",
+    )
+    .bind(fixture.workspace_id.to_string())
+    .fetch_one(fixture.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(saved_origin, "http://example.com");
 
     let registered = app
         .oneshot(request("https://orbit-tunnel.example"))

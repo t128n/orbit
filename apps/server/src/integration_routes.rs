@@ -734,6 +734,7 @@ async fn invalidate_github_poll_config(
 fn github_registration_origin(
     settings: &GithubSettings,
     headers: &HeaderMap,
+    allow_http: bool,
     request_id: Option<&RequestId>,
 ) -> Result<String, ApiError> {
     let candidate = if settings.allow_request_origin {
@@ -751,7 +752,7 @@ fn github_registration_origin(
         .filter(|value| value.len() <= MAX_URL_CHARS)
         .and_then(|value| reqwest::Url::parse(value).ok());
     if let Some(url) = parsed.filter(|url| {
-        url.scheme() == "https"
+        (url.scheme() == "https" || (settings.allow_request_origin && allow_http))
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
@@ -765,7 +766,7 @@ fn github_registration_origin(
         StatusCode::UNPROCESSABLE_ENTITY,
         "github_https_required",
         "HTTPS required",
-        "Open Orbit through a public HTTPS URL before you register the App.",
+        "Open Orbit through a public HTTPS URL, or switch GitHub sync to polling in Development to register the App over HTTP.",
         request_id,
     ))
 }
@@ -784,7 +785,19 @@ pub(crate) async fn start_github_manifest(
     let (_, can_manage) = github_workspace_access(&state, &headers, &workspace, id).await?;
     require_github_manager(can_manage, id)?;
     check_github_binding(&state, id).await?;
-    let origin = github_registration_origin(settings, &headers, id)?;
+    let sync_mode: Option<String> = sqlx::query_scalar(
+        "SELECT sync_mode FROM github_workspace_settings WHERE workspace_id = $1",
+    )
+    .bind(&workspace)
+    .fetch_optional(state.tasks.database().pool())
+    .await
+    .map_err(|_| ApiError::internal(id))?;
+    let origin = github_registration_origin(
+        settings,
+        &headers,
+        sync_mode.as_deref() == Some("polling"),
+        id,
+    )?;
     let organization = body.organization.as_deref().unwrap_or("").trim();
     if !organization.is_empty()
         && (organization.len() > 39
@@ -817,13 +830,6 @@ pub(crate) async fn start_github_manifest(
             id,
         ));
     }
-    let sync_mode: Option<String> = sqlx::query_scalar(
-        "SELECT sync_mode FROM github_workspace_settings WHERE workspace_id = $1",
-    )
-    .bind(&workspace)
-    .fetch_optional(state.tasks.database().pool())
-    .await
-    .map_err(|_| ApiError::internal(id))?;
     let token = generate_opaque_token();
     let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     let mut tx = state

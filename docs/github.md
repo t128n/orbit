@@ -20,16 +20,16 @@ The database binds to one GitHub host. Existing databases with GitHub records ar
 
 ## Server setup
 
-1. Give Orbit a public HTTPS URL that serves both the UI and `/api/v1/integrations/github/webhook` to GitHub. In production, set the server's canonical `ORBIT_PUBLIC_ORIGIN=https://orbit.example.com`. For local testing, use a public HTTPS tunnel to the Orbit web server with its `/api` proxy; Orbit uses the HTTPS domain open in your browser when you start App registration.
+1. For webhook sync, give Orbit a public HTTPS URL that serves both the UI and `/api/v1/integrations/github/webhook` to GitHub. In production, set the server's canonical `ORBIT_PUBLIC_ORIGIN=https://orbit.example.com`. For local testing, use a public HTTPS tunnel to the Orbit web server with its `/api` proxy; Orbit uses the HTTPS domain open in your browser when you start App registration. Workspace polling does not need inbound webhooks, so any browser HTTP origin can register the App when polling is active in Development.
 2. Generate a 32-byte key with `openssl rand -base64 32`. Store it as `ORBIT_APP_KEY`, or put it in a file and set `ORBIT_APP_KEY_FILE` to the file path. Keep this key outside the database and its backups. Orbit cannot verify webhooks or use the saved App credentials if the key is lost.
 3. Set `ORBIT_GITHUB_URL` if needed as described above, then restart Orbit. Do not set `GITHUB_CONNECTIONS` or the older `GITHUB_*` connection variables; Orbit no longer reads them.
 
-For local development, `just dev` also loads a root `.env.local` file. Put `ORBIT_APP_KEY=<base64-key>` there. Keep the file private and out of Git. Open Orbit through a public HTTPS tunnel to the web server before you select **Register GitHub App**. You do not need to set `ORBIT_PUBLIC_ORIGIN` to the tunnel URL for this development flow. A plain `http://127.0.0.1` tab cannot register a GitHub App.
+For local development, `just dev` also loads a root `.env.local` file. Put `ORBIT_APP_KEY=<base64-key>` there. Keep the file private and out of Git. In Development Orbit accepts the browser's own origin, so open Orbit through a public HTTPS tunnel for webhook sync or through any HTTP origin, such as `http://localhost` or `http://example.com`, after choosing polling. You do not need to set `ORBIT_PUBLIC_ORIGIN` for this development flow.
 
 ## Register the workspace App and connect a project
 
 1. Open **Settings → GitHub** as a workspace owner or admin.
-2. Enter a GitHub organization name if the organization should own the App, or leave it blank for a personal App. Select **Register GitHub App**. Register and approve it on the chosen GitHub host. Orbit sends a private App manifest to GitHub; only the App owner can install it. GitHub sends a one-time code to Orbit, and Orbit stores the App credentials. This needs a reachable HTTPS origin.
+2. Enter a GitHub organization name if the organization should own the App, or leave it blank for a personal App. Select **Register GitHub App**. Register and approve it on the chosen GitHub host. Orbit sends a private App manifest to GitHub; only the App owner can install it. GitHub sends a one-time code to Orbit, and Orbit stores the App credentials. Webhook sync needs a reachable HTTPS origin; polling also accepts an HTTP origin in Development.
 3. Select **Install or change repositories** in workspace settings. Install the App on the GitHub account and select the repositories. GitHub sends installation events to Orbit.
 4. Open **Tasks → Project settings → GitHub** and refresh after installation. Select a repository and enter a GitHub label, then save. Create the same label in GitHub. You can connect more projects to the same repository if each project uses a different label. A project has one repository connection.
 5. Add that label to an issue or pull request. Orbit creates one task in the selected project. Later GitHub edits update its title and body; close and reopen events update its status. A merged pull request completes its task. A pull request closed without a merge cancels its task. Reopening it moves the task to unstarted. Removing the label pauses updates, keeps the task, and shows a **GitHub sync paused** badge. Adding the label again resumes updates on the same task. Do not put two configured project labels on one issue or pull request.
@@ -46,7 +46,7 @@ GitHub App registration uses the [GitHub App manifest flow](https://docs.github.
 
 ## Workspace polling mode
 
-The setup above describes the default webhook integration. A workspace-level polling mode is available for Orbit instances that are accessible to users over private HTTPS but cannot receive inbound GitHub webhooks. The browser must be able to reach Orbit over HTTPS for registration and the callback.
+The setup above describes the default webhook integration. A workspace-level polling mode is available for Orbit instances that are accessible to users over private HTTPS but cannot receive inbound GitHub webhooks. The browser must be able to reach Orbit for registration and the callback. In Development, any HTTP origin is accepted when polling is active.
 
 In polling mode, the App manifest leaves webhooks inactive. Orbit discovers App installations and repository access through outbound GitHub API requests rather than installation events. Workspace owners and admins can choose a polling interval from 1 to 15 minutes, with a default of 5 minutes. Shorter intervals reduce synchronization latency but consume more GitHub API quota; longer intervals conserve quota but delay updates.
 
