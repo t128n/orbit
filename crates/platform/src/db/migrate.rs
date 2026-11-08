@@ -521,6 +521,11 @@ impl MigrationRunner {
                     include_str!("../../../../apps/server/migrations/0077_chat_interactivity.sql"),
                     false,
                 ),
+                Migration::new(
+                    78,
+                    include_str!("../../../../apps/server/migrations/0078_github_two_way_sync.sql"),
+                    false,
+                ),
             ],
         );
         runner.postgres = vec![
@@ -709,6 +714,13 @@ impl MigrationRunner {
                 77,
                 include_str!(
                     "../../../../apps/server/migrations/postgres/0077_chat_interactivity.sql"
+                ),
+                false,
+            ),
+            Migration::new(
+                78,
+                include_str!(
+                    "../../../../apps/server/migrations/postgres/0078_github_two_way_sync.sql"
                 ),
                 false,
             ),

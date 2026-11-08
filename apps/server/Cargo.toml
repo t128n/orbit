@@ -26,10 +26,11 @@ orbit-domain = { path = "../../crates/orbit" }
 orbit-platform = { path = "../../crates/platform" }
 percent-encoding = "2"
 rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+rsa = { version = "0.9", features = ["sha2", "pem"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 subtle = "2"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"

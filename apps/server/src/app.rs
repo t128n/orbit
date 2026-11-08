@@ -355,6 +355,7 @@ impl App {
             obsidian_imports.clone(),
             workspace_exports.clone(),
             billing.clone(),
+            app_key,
             config.jobs.concurrency,
         )
         .await?;
@@ -982,6 +983,7 @@ async fn initialize_production_services(
     obsidian_imports: ObsidianImportService,
     workspace_exports: WorkspaceExportService,
     billing: Option<crate::billing::Billing>,
+    app_key: Option<[u8; 32]>,
     concurrency: usize,
 ) -> Result<ProductionServices, AppError> {
     let store = JobStore::new(database.clone());
@@ -994,6 +996,7 @@ async fn initialize_production_services(
     let integrity_failure = failure.clone();
     let worker_config = WorkerConfig::new(concurrency)
         .map_err(|error| AppError::ProductionServices(error.to_string()))?;
+    let github_sync = crate::github::GithubSyncService::new(database.clone(), app_key);
     let worker = Worker::new(store, worker_config)
         .with_handler(maintenance_kind("workspace.retention"), move |_| {
             let repository = Arc::clone(&retention_repository);
@@ -1095,6 +1098,7 @@ async fn initialize_production_services(
         .and_then(|worker| crate::trello::import::register_jobs(worker, trello_imports))
         .and_then(|worker| crate::obsidian::import::register_jobs(worker, obsidian_imports))
         .and_then(|worker| crate::workspace_export::register_job(worker, workspace_exports))
+        .and_then(|worker| github_sync.register_jobs(worker))
         .and_then(|worker| match billing {
             Some(billing) => crate::billing::register_jobs(worker, billing),
             None => Ok(worker),
