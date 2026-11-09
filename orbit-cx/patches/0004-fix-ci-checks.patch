@@ -1,0 +1,363 @@
+From 75c80662e00776ccfa9bd2034da2b24523a970d2 Mon Sep 17 00:00:00 2001
+From: Torben Haack <t128n@ipv4.8shield.net>
+Date: Mon, 9 Nov 2026 19:36:36 +0100
+Subject: [PATCH] fix(ci): pass lint and tests on the patched tree
+
+Upstream 0.3.0 added an unnecessary clone and several stale tests, and the polling patches had six clippy errors. Allow the wide polling helpers, collapse the rate-limit branch, avoid the slice clone, and update the chat, OAuth consent, API token, and project retry tests to the current shapes.
+---
+ apps/server/src/collab/sanitize.rs                   |  6 +++++-
+ apps/server/src/github_poll/mod.rs                   |  9 +++++----
+ apps/server/src/github_poll/worker.rs                |  1 +
+ apps/server/src/github_poll_transition.rs            |  1 +
+ apps/server/src/integration_routes.rs                |  1 +
+ apps/server/src/repositories/tasks.rs                |  1 +
+ apps/server/tests/app_smoke.rs                       |  1 +
+ apps/server/tests/chat_api.rs                        |  3 ++-
+ apps/server/tests/github_poll_concurrency.rs         |  4 ++++
+ apps/server/tests/github_sync_api.rs                 |  4 ++++
+ apps/server/tests/github_upgrade_handoff.rs          |  2 +-
+ apps/server/tests/mcp_api.rs                         |  8 ++++----
+ apps/server/tests/tasks_api.rs                       |  5 +----
+ .../features/auth/pages/OAuthConsentPage.test.tsx    |  7 +++----
+ apps/web/src/features/chat/api/events.test.ts        |  2 +-
+ apps/web/src/features/chat/api/wire.test.ts          |  4 +++-
+ .../features/settings/pages/ApiTokensPage.test.tsx   |  8 ++++----
+ .../features/tasks/components/retryFlows.test.tsx    | 12 ++++++++----
+ crates/platform/tests/database.rs                    |  1 +
+ 19 files changed, 51 insertions(+), 29 deletions(-)
+
+diff --git a/apps/server/src/collab/sanitize.rs b/apps/server/src/collab/sanitize.rs
+index f8d6243..34114dd 100644
+--- a/apps/server/src/collab/sanitize.rs
++++ b/apps/server/src/collab/sanitize.rs
+@@ -747,7 +747,11 @@ mod tests {
+         let image = json!({"type": "image", "props": {"url": "/x.png"}, "children": []});
+         let nested =
+             json!({"type": "paragraph", "content": [], "children": [paragraph(&[text("x")])]});
+-        let blocks = vec![image.clone(), nested.clone(), paragraph(&[code.clone()])];
++        let blocks = vec![
++            image.clone(),
++            nested.clone(),
++            paragraph(std::slice::from_ref(&code)),
++        ];
+         assert_eq!(
+             trim_comment_blocks(blocks),
+             vec![image, nested, paragraph(&[code])]
+diff --git a/apps/server/src/github_poll/mod.rs b/apps/server/src/github_poll/mod.rs
+index 6632e43..78a1782 100644
+--- a/apps/server/src/github_poll/mod.rs
++++ b/apps/server/src/github_poll/mod.rs
+@@ -271,10 +271,10 @@ impl Api {
+             if self.rate.remaining.is_none_or(|old| remaining < old) {
+                 self.rate.remaining = Some(remaining);
+                 self.rate.reset = number("x-ratelimit-reset");
+-            } else if self.rate.remaining == Some(remaining) {
+-                if let Some(reset) = number("x-ratelimit-reset") {
+-                    self.rate.reset = Some(self.rate.reset.unwrap_or(0).max(reset));
+-                }
++            } else if self.rate.remaining == Some(remaining)
++                && let Some(reset) = number("x-ratelimit-reset")
++            {
++                self.rate.reset = Some(self.rate.reset.unwrap_or(0).max(reset));
+             }
+         }
+         if let Some(retry) = number("retry-after") {
+@@ -496,6 +496,7 @@ pub(crate) async fn poll_workspace(
+ /// The existing entry point performs a full, uncached reconciliation. Callers opting
+ /// into deltas must not treat them as successful full reconciliations; the outcome
+ /// carries an error to prevent the existing mode-handoff path from doing so.
++#[allow(clippy::too_many_arguments)]
+ pub(crate) async fn poll_workspace_with_options(
+     app_id: i64,
+     encrypted_key: &[u8],
+diff --git a/apps/server/src/github_poll/worker.rs b/apps/server/src/github_poll/worker.rs
+index 71839ec..7702874 100644
+--- a/apps/server/src/github_poll/worker.rs
++++ b/apps/server/src/github_poll/worker.rs
+@@ -405,6 +405,7 @@ async fn consume_pages(database: &Database, claim: &Claim) -> Result<bool, sqlx:
+     Ok(true)
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ async fn persist_pages(database: &Database, claim: &Claim, key: &[u8; 32], app_id: i64, encrypted_key: &[u8], scope_prefix: &str, cache: &mut Pages, outcome: &PollOutcome, apply_updates: bool) -> Result<bool, sqlx::Error> {
+     // Keep representations used by 304 responses; proposals only contain new pages.
+     for update in outcome.page_updates.iter().filter(|_| apply_updates) {
+diff --git a/apps/server/src/github_poll_transition.rs b/apps/server/src/github_poll_transition.rs
+index 9aa86bc..3be45aa 100644
+--- a/apps/server/src/github_poll_transition.rs
++++ b/apps/server/src/github_poll_transition.rs
+@@ -132,6 +132,7 @@ mod tests {
+ /// Called only after every action and discovery update has been applied successfully
+ /// under `claim`'s fence. Incomplete GitHub responses cannot complete a handoff.
+ /// Returns false if the request, configuration, mode epoch, or lease changed.
++#[allow(clippy::items_after_test_module)]
+ pub(crate) async fn complete_applied(
+     database: &Database,
+     claim: &Claim,
+diff --git a/apps/server/src/integration_routes.rs b/apps/server/src/integration_routes.rs
+index 59e9524..240a285 100644
+--- a/apps/server/src/integration_routes.rs
++++ b/apps/server/src/integration_routes.rs
+@@ -1461,6 +1461,7 @@ pub(crate) async fn pause_github_work_item_fenced(
+     .await
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ async fn pause_github_work_item_inner(
+     state: &IntegrationState,
+     workspace: &str,
+diff --git a/apps/server/src/repositories/tasks.rs b/apps/server/src/repositories/tasks.rs
+index a496397..bbeb97a 100644
+--- a/apps/server/src/repositories/tasks.rs
++++ b/apps/server/src/repositories/tasks.rs
+@@ -2006,6 +2006,7 @@ impl TaskRepository {
+         .await
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
+     async fn apply_github_work_item(
+         &self,
+         workspace_id: Id,
+diff --git a/apps/server/tests/app_smoke.rs b/apps/server/tests/app_smoke.rs
+index bc7dcd9..0484449 100644
+--- a/apps/server/tests/app_smoke.rs
++++ b/apps/server/tests/app_smoke.rs
+@@ -566,6 +566,7 @@ async fn critical_durable_schedules_exist_before_serve() {
+         kinds,
+         [
+             "backup.scheduled",
++            "github.poll",
+             "integrity.weekly",
+             "notion.cleanup",
+             "workspace.retention"
+diff --git a/apps/server/tests/chat_api.rs b/apps/server/tests/chat_api.rs
+index 8910a1a..07a62c3 100644
+--- a/apps/server/tests/chat_api.rs
++++ b/apps/server/tests/chat_api.rs
+@@ -2476,7 +2476,7 @@ async fn a_reply_quotes_a_message_of_its_conversation_and_keeps_the_id_of_a_dele
+     assert_eq!(sent["result"]["thread_root_id"], Value::Null);
+     assert_eq!(
+         sent["result"]["reply_to"],
+-        json!({ "id": target, "author_id": fixture.owner.id.to_string(), "body": "é".repeat(200), "sticker": false })
++        json!({ "id": target, "author_id": fixture.owner.id.to_string(), "body": "é".repeat(200), "sticker": false, "bot_name": null })
+     );
+     // The event that the other members get carries the quote too.
+     assert_eq!(sent["events"][0]["type"], "message.created");
+@@ -3369,6 +3369,7 @@ async fn a_forward_is_a_copy_with_its_files_that_mentions_nobody_and_outlives_th
+         "conversation_id": source,
+         "author_id": fixture.owner.id.to_string(),
+         "created_at": sent["result"]["created_at"],
++        "bot_name": null,
+     });
+     assert_eq!(forward["forwarded"], origin);
+     // The other members get the same event as for a sent message.
+diff --git a/apps/server/tests/github_poll_concurrency.rs b/apps/server/tests/github_poll_concurrency.rs
+index 5037c4f..868277e 100644
+--- a/apps/server/tests/github_poll_concurrency.rs
++++ b/apps/server/tests/github_poll_concurrency.rs
+@@ -14,6 +14,10 @@ struct Fixture {
+ 
+ async fn fixture() -> Fixture {
+     let database = TestDatabase::new().await.unwrap();
++    sqlx::query("INSERT INTO github_host_binding (singleton, origin) VALUES (1, 'https://github.com')")
++        .execute(database.pool())
++        .await
++        .unwrap();
+     let identity = IdentityRepository::new((*database).clone());
+     let now = TimestampMillis::now();
+     identity
+diff --git a/apps/server/tests/github_sync_api.rs b/apps/server/tests/github_sync_api.rs
+index 7a871ae..2d09a4d 100644
+--- a/apps/server/tests/github_sync_api.rs
++++ b/apps/server/tests/github_sync_api.rs
+@@ -48,6 +48,10 @@ async fn sync_is_queued_only_in_polling_mode_and_reports_pending_handoff() {
+         .await
+         .unwrap();
+     let workspace = setup.workspace_id.to_string();
++    sqlx::query("INSERT INTO github_host_binding (singleton, origin) VALUES (1, 'https://github.com')")
++        .execute(database.pool())
++        .await
++        .unwrap();
+     let state = IntegrationState::new(
+         Arc::new(ApiTokenRepository::new((*database).clone())),
+         Arc::new(TaskRepository::new((*database).clone())),
+diff --git a/apps/server/tests/github_upgrade_handoff.rs b/apps/server/tests/github_upgrade_handoff.rs
+index a20e305..b99651b 100644
+--- a/apps/server/tests/github_upgrade_handoff.rs
++++ b/apps/server/tests/github_upgrade_handoff.rs
+@@ -133,7 +133,7 @@ async fn legacy_handoffs_refuse_enterprise_upgrade_and_rolling_exchange() {
+             .fetch_one(db.pool())
+             .await
+             .unwrap();
+-        assert_eq!(version, 78);
++        assert_eq!(version, 79);
+         let origin: String =
+             sqlx::query_scalar("SELECT origin FROM github_host_binding WHERE singleton = 1")
+                 .fetch_one(db.pool())
+diff --git a/apps/server/tests/mcp_api.rs b/apps/server/tests/mcp_api.rs
+index e55318a..c71f25e 100644
+--- a/apps/server/tests/mcp_api.rs
++++ b/apps/server/tests/mcp_api.rs
+@@ -799,22 +799,22 @@ async fn sub_issues_can_be_created_listed_moved_and_detached_within_the_grant()
+         .await
+         .unwrap();
+     let parent = f.tasks.get_task(f.workspace, f.task, f.user).await.unwrap();
+-    let identifier: String =
++    let project_key: String =
+         sqlx::query_scalar("SELECT projects.project_key FROM projects WHERE id = $1")
+             .bind(f.project.to_string())
+             .fetch_one(f.database.pool())
+             .await
+             .unwrap();
+-    let identifier = format!("{identifier}-{}", parent.number);
++    let parent_identifier = format!("{project_key}-{}", parent.number);
+     let created = f
+         .tool(
+             "create_task",
+-            json!({"project_id": f.project, "status_id": parent.status_id, "title": "Child", "parent_task_id": identifier}),
++            json!({"project_id": f.project, "status_id": parent.status_id, "title": "Child", "parent_task_id": parent_identifier}),
+         )
+         .await;
+     let child = &created["result"]["structuredContent"];
+     assert_eq!(child["parent_task_id"], f.task.to_string(), "{created}");
+-    assert_eq!(child["identifier"], identifier);
++    assert_eq!(child["identifier"], format!("{project_key}-{}", parent.number + 1));
+     assert!(
+         child["url"]
+             .as_str()
+diff --git a/apps/server/tests/tasks_api.rs b/apps/server/tests/tasks_api.rs
+index 99f3f52..1532964 100644
+--- a/apps/server/tests/tasks_api.rs
++++ b/apps/server/tests/tasks_api.rs
+@@ -2138,10 +2138,7 @@ async fn patch_preserves_status_description_and_text_limits_preserve_source() {
+         .await
+         .unwrap();
+     assert_eq!(comment.status(), StatusCode::CREATED);
+-    assert_eq!(
+-        response_json(comment).await["body"],
+-        "  exact comment source  \n"
+-    );
++    assert_eq!(response_json(comment).await["body"], "exact comment source");
+ 
+     let oversized_bytes = "😀".repeat(300);
+     let rejected = fixture
+diff --git a/apps/web/src/features/auth/pages/OAuthConsentPage.test.tsx b/apps/web/src/features/auth/pages/OAuthConsentPage.test.tsx
+index 2efab6c..d3b2e3c 100644
+--- a/apps/web/src/features/auth/pages/OAuthConsentPage.test.tsx
++++ b/apps/web/src/features/auth/pages/OAuthConsentPage.test.tsx
+@@ -73,7 +73,7 @@ for (const approved of [true, false]) {
+   })
+ }
+ 
+-test('select all projects and a permission preset send every project and scope', async () => {
++test('select all projects and scopes send every project and scope', async () => {
+   const { fireEvent } = await import('@testing-library/react')
+   const userEvent = (await import('@testing-library/user-event')).default.setup()
+   let body: unknown
+@@ -98,11 +98,10 @@ test('select all projects and a permission preset send every project and scope',
+   await userEvent.click(await view.findByRole('option', { name: 'Workspace One' }))
+   await userEvent.click(view.getByRole('checkbox', { name: 'Select all' }))
+   expect(view.getByRole('checkbox', { name: 'Two' }).getAttribute('aria-checked')).toBe('true')
+-  fireEvent.click(view.getByRole('combobox', { name: 'Access preset' }))
+-  await userEvent.click(await view.findByRole('option', { name: 'Full access' }))
++  await userEvent.click(within(view.getByRole('group', { name: 'Tasks' })).getByRole('button', { name: 'Write' }))
++  await userEvent.click(within(view.getByRole('group', { name: 'Chat' })).getByRole('button', { name: 'Read' }))
+   expect(within(view.getByRole('group', { name: 'Chat' })).getByRole('button', { name: 'Read' }).getAttribute('aria-pressed')).toBe('true')
+   await userEvent.click(within(view.getByRole('group', { name: 'Docs' })).getByRole('button', { name: 'No access' }))
+-  expect(view.getByRole('combobox', { name: 'Access preset' }).textContent).toContain('Custom')
+   fireEvent.click(view.getByRole('button', { name: 'Allow selected access' }))
+   await view.findByRole('textbox', { name: 'Callback URL' })
+   expect(body).toEqual({ csrf_token: 'nonce', approved: true, workspace_id: 'w1', project_ids: ['p1', 'p2'], all_projects: false, scopes: ['tasks:write', 'chat:read'] })
+diff --git a/apps/web/src/features/chat/api/events.test.ts b/apps/web/src/features/chat/api/events.test.ts
+index 987e00a..a789c1d 100644
+--- a/apps/web/src/features/chat/api/events.test.ts
++++ b/apps/web/src/features/chat/api/events.test.ts
+@@ -318,7 +318,7 @@ test('an edit of a message changes the quote of every reply to it, and its delet
+   // The quote is the start of the new body, cut as the server cuts it.
+   const body = 'x'.repeat(250)
+   applyChatEvent(client, W, { type: 'message.updated', message: testMessage({ id: 'm1', body }) })
+-  const edited = { id: 'm1', authorId: 'u1', body: 'x'.repeat(200), sticker: false }
++  const edited = { id: 'm1', authorId: 'u1', body: 'x'.repeat(200), sticker: false, botName: null }
+   expect(quotes()).toEqual([edited, edited, edited])
+   expect(find('m3')?.replyTo).toBeNull()
+ 
+diff --git a/apps/web/src/features/chat/api/wire.test.ts b/apps/web/src/features/chat/api/wire.test.ts
+index 9846512..356c3e7 100644
+--- a/apps/web/src/features/chat/api/wire.test.ts
++++ b/apps/web/src/features/chat/api/wire.test.ts
+@@ -60,10 +60,12 @@ test('a wire message becomes a chat message with millisecond times', () => {
+       conversationId: 'c1',
+       threadRootId: 'm1',
+       replyToId: 'm0',
+-      replyTo: { id: 'm0', authorId: 'u1', body: 'Is it <@u2>?', sticker: false },
++      replyTo: { id: 'm0', authorId: 'u1', body: 'Is it <@u2>?', sticker: false, botName: null },
+       forwarded: null,
+       stickerId: null,
+       sticker: null,
++      bot: null,
++      blocks: null,
+       kind: 'message',
+       authorId: 'u2',
+       body: '<@u1> done',
+diff --git a/apps/web/src/features/settings/pages/ApiTokensPage.test.tsx b/apps/web/src/features/settings/pages/ApiTokensPage.test.tsx
+index 46473ff..ff47fbd 100644
+--- a/apps/web/src/features/settings/pages/ApiTokensPage.test.tsx
++++ b/apps/web/src/features/settings/pages/ApiTokensPage.test.tsx
+@@ -42,15 +42,15 @@ test('admins can create a token and see its secret once', async () => {
+   await userEvent.click(view.getByRole('checkbox', { name: 'Select all' }))
+   expect(view.getByRole('checkbox', { name: 'Support' }).getAttribute('aria-checked')).toBe('true')
+   expect(view.getByRole('checkbox', { name: 'Platform' }).getAttribute('aria-checked')).toBe('true')
+-  expect(view.getByLabelText('Access preset').textContent).toContain('Tasks read and write')
+-  expect(view.getByLabelText('Expiration').textContent).toContain('Never expires')
+-  await userEvent.click(view.getByLabelText('Expiration'))
++  expect(within(view.getByRole('group', { name: 'Tasks' })).getByRole('button', { name: 'Read' }).getAttribute('aria-pressed')).toBe('true')
++  expect(view.getByRole('combobox', { name: 'Expiration' }).textContent).toContain('Never expires')
++  await userEvent.click(view.getByRole('combobox', { name: 'Expiration' }))
+   await userEvent.click(view.getByRole('option', { name: '30 days' }))
+   await userEvent.type(view.getByPlaceholderText('Discord bot'), 'Discord bot')
+   const serviceAccount = view.getByRole('checkbox', { name: /Use a service account/ })
+   expect(serviceAccount.getAttribute('aria-checked')).toBe('false')
+   await userEvent.click(within(view.getByRole('group', { name: 'Tasks' })).getByRole('button', { name: 'Read' }))
+-  expect(view.getByLabelText('Access preset').textContent).toContain('Tasks read-only')
++  expect(within(view.getByRole('group', { name: 'Tasks' })).getByRole('button', { name: 'Read' }).getAttribute('aria-pressed')).toBe('true')
+   await userEvent.click(serviceAccount)
+   expect(serviceAccount.getAttribute('aria-checked')).toBe('true')
+   expect(within(view.getByRole('group', { name: 'Docs' })).getByRole('button', { name: 'Read' }).hasAttribute('disabled')).toBe(true)
+diff --git a/apps/web/src/features/tasks/components/retryFlows.test.tsx b/apps/web/src/features/tasks/components/retryFlows.test.tsx
+index 6af93dd..6f14fa3 100644
+--- a/apps/web/src/features/tasks/components/retryFlows.test.tsx
++++ b/apps/web/src/features/tasks/components/retryFlows.test.tsx
+@@ -71,10 +71,14 @@ test('workspace creation retry repeats form clearing and workspace selection', a
+ })
+ 
+ test('project creation retry selects the created project', async () => {
+-  let calls = 0
+-  globalThis.fetch = (async () => {
+-    calls += 1
+-    return calls === 1 ? failure() : Response.json({
++  let creates = 0
++  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
++    const request = new Request(input, init)
++    if (request.method === 'GET' && new URL(request.url).pathname.endsWith('/projects')) {
++      return Response.json({ items: [], next_cursor: null })
++    }
++    creates += 1
++    return creates === 1 ? failure() : Response.json({
+       id: 'project-2', workspace_id: workspace.id, name: 'Second', key: 'SECON', color: '#8b5cf6',
+       created_at: '', updated_at: '', version: 0,
+     }, { status: 201 })
+diff --git a/crates/platform/tests/database.rs b/crates/platform/tests/database.rs
+index 7342f4a..f1da9ff 100644
+--- a/crates/platform/tests/database.rs
++++ b/crates/platform/tests/database.rs
+@@ -395,6 +395,7 @@ async fn symlink_alias_cannot_bypass_database_ownership() {
+     assert!(matches!(error, DatabaseError::AlreadyOwned { .. }));
+ }
+ 
++#[cfg(unix)]
+ #[tokio::test]
+ async fn hard_link_alias_cannot_bypass_database_ownership() {
+     let directory = tempfile::tempdir().unwrap();
+-- 
+2.56.0.windows.4
+

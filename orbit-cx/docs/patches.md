@@ -10,6 +10,7 @@ Each patch holds one complete feature, and the four-digit prefix sets its applic
 orbit-cx/patches/0001-feat-configurable-github-host.patch
 orbit-cx/patches/0002-feat-github-polling-sync.patch
 orbit-cx/patches/0003-chore-fork-versioning-scheme.patch
+orbit-cx/patches/0004-fix-ci-checks.patch
 ```
 
 The type and slug follow Conventional Commits: `feat`, `fix`, or `chore`, then a short description. A feature whose upstream work spanned several pull requests lands as one patch, with its fixes squashed in. That keeps the series short and stops a half-applied feature from sitting between two patches.

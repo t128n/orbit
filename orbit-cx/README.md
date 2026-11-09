@@ -2,13 +2,14 @@
 
 Orbit-CX adds enterprise GitHub features to [Orbit](https://github.com/coollabsio/orbit) as committed patch sets instead of edits to upstream source. The fork stays mergeable with upstream, and every custom change lives in `orbit-cx/patches/` where you can review, reorder, or drop it.
 
-The patch series changes three things:
+The patch series adds three features and one maintenance patch that keeps the patched tree green in CI:
 
 - **GitHub host**: run against GitHub Enterprise Server or Enterprise Cloud through `ORBIT_GITHUB_URL`
 - **Sync mode**: keep workspaces in sync from behind a firewall, without inbound webhooks
 - **Versioning**: accept SemVer build metadata in the version scripts
+- **CI checks**: clear the lint and test failures that upstream and the patch series introduce
 
-Each patch contains one complete feature, with its tests and follow-up fixes included. A feature that needed several pull requests upstream lands as a single patch here.
+Each patch contains one complete change, with its tests and follow-up fixes included. A feature that needed several pull requests upstream lands as a single patch here.
 
 ## Repository layout
 
@@ -24,7 +25,8 @@ orbit-cx/
 ├── patches/
 │   ├── 0001-feat-configurable-github-host.patch
 │   ├── 0002-feat-github-polling-sync.patch
-│   └── 0003-chore-fork-versioning-scheme.patch
+│   ├── 0003-chore-fork-versioning-scheme.patch
+│   └── 0004-fix-ci-checks.patch
 └── scripts/
     ├── apply-patches.sh    # Bash: Linux, macOS, Git Bash
     └── apply-patches.ps1   # PowerShell: Windows
@@ -39,6 +41,7 @@ Apply the patches in filename order:
 | [`0001-feat-configurable-github-host.patch`](patches/0001-feat-configurable-github-host.patch) | Configurable GitHub host | Select GitHub Enterprise Server or Enterprise Cloud with `ORBIT_GITHUB_URL` |
 | [`0002-feat-github-polling-sync.patch`](patches/0002-feat-github-polling-sync.patch) | Polling sync | Sync workspaces by polling with App installation tokens, including the web and mobile settings UI, HTTP registration, and the polling App manifest |
 | [`0003-chore-fork-versioning-scheme.patch`](patches/0003-chore-fork-versioning-scheme.patch) | Fork versioning | Accept SemVer build metadata (`+`) in the version scripts and build tools |
+| [`0004-fix-ci-checks.patch`](patches/0004-fix-ci-checks.patch) | CI checks | Clear the clippy warnings and stale tests that upstream 0.3.0 and the patch series introduce |
 
 ## Apply the patches
 
