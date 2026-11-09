@@ -1,4 +1,4 @@
-From 5ed227d2c47b7649e4cd21622b1db70789854c08 Mon Sep 17 00:00:00 2001
+From d478144566d8f21714f4aa5e21c62df1e84fe027 Mon Sep 17 00:00:00 2001
 From: Torben Haack <t128n@ipv4.8shield.net>
 Date: Sun, 8 Nov 2026 16:20:18 +0100
 Subject: [PATCH] feat: support configurable github enterprise hosts
@@ -1410,7 +1410,7 @@ index d003179..6668cf6 100644
              .bind(provider.as_str())
              .execute(&mut *transaction)
 diff --git a/apps/server/src/repositories/tasks.rs b/apps/server/src/repositories/tasks.rs
-index db17e2d..e9ede64 100644
+index bc0bc1f..94bb2ea 100644
 --- a/apps/server/src/repositories/tasks.rs
 +++ b/apps/server/src/repositories/tasks.rs
 @@ -1,6 +1,8 @@
@@ -2033,7 +2033,7 @@ index 0000000..a20e305
 +    }
 +}
 diff --git a/apps/server/tests/integrations_api.rs b/apps/server/tests/integrations_api.rs
-index 045e05f..587cabf 100644
+index a6303e1..a8ddc8c 100644
 --- a/apps/server/tests/integrations_api.rs
 +++ b/apps/server/tests/integrations_api.rs
 @@ -19,6 +19,69 @@ use serde_json::{Value, json};
@@ -2106,7 +2106,7 @@ index 045e05f..587cabf 100644
  #[tokio::test]
  async fn database_github_app_routes_issues_without_orbit_tokens() {
      let fixture = fixture().await;
-@@ -1724,6 +1787,9 @@ struct Fixture {
+@@ -1775,6 +1838,9 @@ struct Fixture {
  
  async fn fixture() -> Fixture {
      let database = TestDatabase::new().await.unwrap();
@@ -2367,7 +2367,7 @@ index c96d6ab..e87b10b 100644
          (*fixture.database).clone(),
          Arc::new(store),
 diff --git a/apps/server/tests/tasks_api.rs b/apps/server/tests/tasks_api.rs
-index 8333dbd..2944386 100644
+index 3f00d9a..99f3f52 100644
 --- a/apps/server/tests/tasks_api.rs
 +++ b/apps/server/tests/tasks_api.rs
 @@ -30,6 +30,9 @@ struct Fixture {

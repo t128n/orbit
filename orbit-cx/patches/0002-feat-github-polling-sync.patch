@@ -1,4 +1,4 @@
-From ebda9837df4bc38d3cf9d4de41f3a6ed9584a6ae Mon Sep 17 00:00:00 2001
+From 322bc02867899de1d26cec3348a4636971d97f85 Mon Sep 17 00:00:00 2001
 From: Torben Haack <t128n@ipv4.8shield.net>
 Date: Sun, 8 Nov 2026 16:20:19 +0100
 Subject: [PATCH] feat: background GitHub App polling synchronization
@@ -59,7 +59,7 @@ Key capabilities:
  create mode 100644 apps/web/src/features/settings/pages/GithubPageApi.ts
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 1e31a08..4d60e32 100644
+index c433157..31bceff 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -2435,6 +2435,7 @@ dependencies = [
@@ -3207,7 +3207,7 @@ index 80597f2..8d72981 100644
  #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, utoipa::ToSchema)]
  pub struct TrialCounts {
 diff --git a/apps/server/src/repositories/tasks.rs b/apps/server/src/repositories/tasks.rs
-index e9ede64..f5e7b2e 100644
+index 94bb2ea..a496397 100644
 --- a/apps/server/src/repositories/tasks.rs
 +++ b/apps/server/src/repositories/tasks.rs
 @@ -297,6 +297,79 @@ pub struct GithubWorkItem {
@@ -3467,7 +3467,7 @@ index e9ede64..f5e7b2e 100644
 +            };
 +            let status_id: String = if state_changed || was_deleted {
                  sqlx::query_scalar(
-                         "SELECT id FROM task_statuses WHERE workspace_id = $1 AND project_id = $2 AND category = $3 ORDER BY position, id LIMIT 1",
+                         "SELECT id FROM task_statuses WHERE workspace_id = $1 AND project_id = $2 AND category = $3 ORDER BY CASE WHEN lower(name) = 'done' THEN 0 ELSE 1 END, position, id LIMIT 1",
                      ).bind(workspace_id.to_string()).bind(row.get::<String, _>("project_id"))
 @@ -1987,9 +2173,11 @@ impl TaskRepository {
                      .bind(task_id.to_string())
@@ -4013,7 +4013,7 @@ index 0000000..7a871ae
 +    assert!(status["next_poll_at"].is_null());
 +}
 diff --git a/apps/server/tests/integrations_api.rs b/apps/server/tests/integrations_api.rs
-index 587cabf..b8ca740 100644
+index a8ddc8c..e42a753 100644
 --- a/apps/server/tests/integrations_api.rs
 +++ b/apps/server/tests/integrations_api.rs
 @@ -9,11 +9,12 @@ use orbit_platform::{

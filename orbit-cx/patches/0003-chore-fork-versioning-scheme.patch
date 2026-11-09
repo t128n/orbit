@@ -1,4 +1,4 @@
-From a7001217cf436734e3674f6aaa797f492ba07413 Mon Sep 17 00:00:00 2001
+From 2abe78bd8a010aa0b0b3d7c6291a8e984b1c8d82 Mon Sep 17 00:00:00 2001
 From: Torben Haack <t128n@ipv4.8shield.net>
 Date: Sat, 7 Nov 2026 21:51:58 +0100
 Subject: [PATCH] chore: support counter build metadata in versioning scripts
