@@ -30,7 +30,20 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('bun.lock') }}
       - uses: extractions/setup-just@v3
+      # Orbit-CX features live in orbit-cx/patches/, so every build and check runs on the
+      # patched tree. See orbit-cx/docs/patches.md.
+      - name: Verify the Orbit-CX patch series
+        run: bash orbit-cx/scripts/apply-patches.sh --check
+      - name: Apply the Orbit-CX patch series
+        run: bash orbit-cx/scripts/apply-patches.sh
+      # The patch series was generated from feature branches that predate formatting. Normalize
+      # it so `just check` (cargo fmt --check) passes on the tree we actually ship.
+      - run: cargo fmt --all
       - run: just setup
+      # The patch series does not carry the generated OpenAPI client, so regenerate it before
+      # the checks to keep `just api-check` consistent with the patched server.
+      - name: Regenerate the API contract for the patched tree
+        run: just api
       - run: bun x playwright install --with-deps chromium
         working-directory: apps/web
       - run: just check
