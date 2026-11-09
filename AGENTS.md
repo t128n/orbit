@@ -2,6 +2,13 @@
 
 Read [`.ai/README.md`](.ai/README.md) first: it lists the project guides in order.
 
+## Orbit-CX overlay
+
+`orbit-cx/` adds the fork's enterprise GitHub features as patch files, with its own docs and scripts. Read
+[`orbit-cx/AGENTS.md`](orbit-cx/AGENTS.md) before changing anything there. The patch series also edits
+[`docs/github.md`](docs/github.md) and [`docs/operations.md`](docs/operations.md), so check the overlay guide before you
+edit those pages.
+
 ## Apps
 
 The repo root is one Bun workspace: `apps/web` (Vite) and `apps/mobile` (Expo, see [`apps/mobile/AGENTS.md`](apps/mobile/AGENTS.md)).
