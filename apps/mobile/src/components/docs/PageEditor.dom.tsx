@@ -9,6 +9,7 @@ import './PageEditor.css'
 
 import { withCollaboration } from '@blocknote/core/yjs'
 import { BlockNoteViewRaw, useCreateBlockNote } from '@blocknote/react'
+import { setEditableInPlace } from '@orbit/editor/editable'
 import { commentMarks } from '@orbit/editor/commentMarks'
 import { CollabSession, type CollabProblem, type CollabState } from '@orbit/editor/collab/session'
 import { collabSocket, COLLAB_FRAGMENT } from '@orbit/editor/collab/target'
@@ -74,7 +75,6 @@ export interface PageEditorProps {
   fileDeleted: (url: string) => Promise<boolean>
   openPage: (pageId: string) => Promise<void>
   openUrl: (url: string) => Promise<void>
-  onStatus: (state: CollabState) => Promise<void>
   onProblem: (problem: CollabProblem) => Promise<void>
   /** Handshakes keep failing: the screen checks the page over REST. */
   onProbe: () => Promise<void>
@@ -200,15 +200,11 @@ export default function PageEditor(props: PageEditorProps) {
     provider.awareness.setLocalStateField('user', actions.current.user)
     const connection = { doc, provider, fragment: doc.getXmlFragment(COLLAB_FRAGMENT) }
     const current = new CollabSession(connection, {
-      onChange: (state) => {
-        setSession((shown) => (shown?.connection === connection ? { connection, state } : shown))
-        void actions.current.onStatus(state)
-      },
+      onChange: (state) => setSession((shown) => (shown?.connection === connection ? { connection, state } : shown)),
       onProblem: (problem) => void actions.current.onProblem(problem),
       onProbe: () => void actions.current.onProbe(),
     })
     setSession({ connection, state: current.state })
-    void actions.current.onStatus(current.state)
     return () => {
       current.destroy()
       setSession(null)
@@ -315,6 +311,10 @@ function Editor({ connection, editable, theme, server, actions, editorRef }: Edi
 
   useEffect(() => watchDeletedFiles(editor, (url) => actions.current.fileDeleted(url)), [editor])
 
+  // The view mounts once, with the first value; later changes switch the mounted editor (see `setEditableInPlace`).
+  const [mountEditable] = useState(editable)
+  useEffect(() => setEditableInPlace(editor, editable), [editor, editable])
+
   useEffect(() => {
     editorRef.current = editor
     let last = ''
@@ -350,7 +350,7 @@ function Editor({ connection, editable, theme, server, actions, editorRef }: Edi
     <div ref={rootRef} className="orbit-editor-root">
       <BlockNoteViewRaw
         editor={editor}
-        editable={editable}
+        editable={mountEditable}
         theme={theme}
         formattingToolbar={false}
         linkToolbar={false}

@@ -19,7 +19,7 @@ use crate::audit::{self, AuditOutcome};
 use crate::billing::TrialLimit;
 use crate::collab::kind_task::members;
 use crate::collab::markdown_import::markdown_to_blocks;
-use crate::collab::sanitize::sanitize_blocks_for;
+use crate::collab::sanitize::{sanitize_blocks_for, trim_comment_blocks};
 use crate::collab::{CollabError, CollabHub, CollabWrite, DocKey, DocKind, LinkPolicy};
 use crate::export::markdown::{KeepLinks, blocks_to_markdown};
 
@@ -1912,7 +1912,7 @@ impl TaskRepository {
             let current_status_id: String = row.get("status_id");
             let status_id: String = if issue.state_changed || was_deleted {
                 sqlx::query_scalar(
-                        "SELECT id FROM task_statuses WHERE workspace_id = $1 AND project_id = $2 AND category = $3 ORDER BY position, id LIMIT 1",
+                        "SELECT id FROM task_statuses WHERE workspace_id = $1 AND project_id = $2 AND category = $3 ORDER BY CASE WHEN lower(name) = 'done' THEN 0 ELSE 1 END, position, id LIMIT 1",
                     ).bind(workspace_id.to_string()).bind(row.get::<String, _>("project_id"))
                         .bind(status_category).fetch_optional(&mut *tx).await?
                         .unwrap_or_else(|| current_status_id.clone())
@@ -2074,7 +2074,7 @@ impl TaskRepository {
         }
         ensure_trial_capacity(&self.database, &mut tx, workspace_id, TrialLimit::Tasks, 1).await?;
         let status_id: String = sqlx::query_scalar(
-            "SELECT id FROM task_statuses WHERE workspace_id = $1 AND project_id = $2 AND category <> 'duplicate' ORDER BY CASE WHEN category = $3 THEN 0 WHEN category = 'unstarted' THEN 1 ELSE 2 END, position, id LIMIT 1",
+            "SELECT id FROM task_statuses WHERE workspace_id = $1 AND project_id = $2 AND category <> 'duplicate' ORDER BY CASE WHEN category = $3 THEN 0 WHEN category = 'unstarted' THEN 1 ELSE 2 END, CASE WHEN lower(name) = 'done' THEN 0 ELSE 1 END, position, id LIMIT 1",
         ).bind(workspace_id.to_string()).bind(issue.project_id.to_string())
             .bind(status_category)
             .fetch_optional(&mut *tx).await?.ok_or(TaskError::NotFound)?;
@@ -2391,6 +2391,7 @@ impl TaskRepository {
         let mut snapshots = Vec::with_capacity(updates.len());
         for update in updates {
             let before = sub_issues::snapshot_in_tx(&mut tx, update.id).await?;
+            let task_before = task_in_tx(&mut tx, workspace_id, update.id, false).await?;
             let blocks = update_task_in_tx(
                 &mut tx,
                 workspace_id,
@@ -2406,6 +2407,22 @@ impl TaskRepository {
             }
             let after = sub_issues::snapshot_in_tx(&mut tx, update.id).await?;
             snapshots.push(before.zip(after));
+            // The task's own activity feed shows what changed (a reorder alone changes nothing it shows).
+            let task_after = task_in_tx(&mut tx, workspace_id, update.id, false).await?;
+            let changes = updated_fields(update, &task_before, &task_after);
+            if changes.as_object().is_some_and(|fields| !fields.is_empty()) {
+                self.record_write(
+                    &mut tx,
+                    workspace_id,
+                    actor_id,
+                    ("task.updated", "task"),
+                    update.id,
+                    request_id,
+                    json!({ "changes": changes }),
+                    now,
+                )
+                .await?;
+            }
         }
         record_mutation(
             &mut tx,
@@ -4091,15 +4108,19 @@ async fn comment_content(
     let policy = task_policy(workspace_id, task_id);
     match content {
         CommentContent::Blocks(blocks) => {
-            let blocks = sanitize_blocks_for(blocks, &policy);
+            let blocks = trim_comment_blocks(sanitize_blocks_for(blocks, &policy));
             if !has_content(&Value::Array(blocks.clone())) {
                 return Err(TaskError::Invalid { field: "body_json" });
             }
             Ok((description_markdown(&blocks), blocks))
         }
         CommentContent::Markdown { body, .. } => {
+            let body = body.trim();
             let blocks = imported_description(tx, workspace_id, body).await?;
-            Ok((body.clone(), sanitize_blocks_for(&blocks, &policy)))
+            Ok((
+                body.to_owned(),
+                trim_comment_blocks(sanitize_blocks_for(&blocks, &policy)),
+            ))
         }
     }
 }
